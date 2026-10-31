@@ -1,0 +1,310 @@
+From d0e5e93e49e514b003db99a7f0981a73e0fae3cd Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:46:27 -0500
+Subject: [PATCH] Mixed-K MoE decode on one exl3_moe_coop_mk launch per stage
+
+Layers whose (Kg, Ku, Kd) widths span two adjacent K (<= 4) now decode on a single
+exl3_moe_coop_mk call (exllamav3 m31-coop-mixedk) instead of one exl3_moe_coop
+launch per K group (patch 0011's split, chained through sh_out). Experts are
+renumbered in ascending K-tuple order at build time (pointer tables and K arrays
+permuted, router ids mapped at decode), so the kernel, which takes runs in
+descending expert order, starts the heavy experts first. VLLM_EXL3_COOP_MK=0
+keeps the per-group split for A/B; same batch bound as the split.
+
+GB10, 2.15 pack TP2 rank, live decode routing, per-layer coop time:
+2-group layers c=1 466 -> 436 us, c=4 978 -> 941 us; 3-group layers c=1 529 ->
+486 us, c=4 1112 -> 999 us. Accuracy vs an fp32 reference unchanged (6.4e-4..
+6.6e-4, same as the split).
+---
+ CHANGELOG.md                       |   8 ++
+ src/vllm_exl3/exl3.py              |  79 ++++++++++++++++-
+ src/vllm_exl3/weight_snapshot.py   |   2 +-
+ tests/test_moe_coop_mk_dispatch.py | 133 +++++++++++++++++++++++++++++
+ 4 files changed, 220 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_moe_coop_mk_dispatch.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eb1eab6..b524aa9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -77,6 +77,14 @@
+   exit in the loop each `ldmatrix` fed the next MMA directly). Same MMAs, same order. GB10,
+   live shapes: gate|up K2 17.57 -> 17.03 ms, K3 17.51 -> 16.71 ms; down unchanged.
+ 
++- Mixed-K MoE decode (verify batches up to `VLLM_EXL3_COOP_SPLIT_MAX_TOKENS`) runs one
++  `exl3_moe_coop_mk` launch per stage instead of one `exl3_moe_coop` launch per (Kg, Ku, Kd)
++  group, for layers whose widths span two adjacent K up to 4 (needs exllamav3 with
++  `exl3_moe_coop_mk`). Experts are renumbered in ascending K-tuple order so the kernel starts
++  the heavy ones first. `VLLM_EXL3_COOP_MK=0` restores the per-group split. GB10, MiniMax-M3.1
++  2.15 pack TP2 rank, live decode routing, per-layer coop time: 2-group layers c=1 466 ->
++  436 us, c=4 978 -> 941 us; 3-group layers c=1 529 -> 486 us, c=4 1112 -> 999 us.
++
+ - Unified `exl3_moe_mixedk` is the default mixed-K dispatch on every device.
+   Per-K-group dispatch costs one launch plus ~9 ATen kernels per K tuple per
+   layer per step at `MOE_SMS_PER_EXPERT` = 8 CTAs of 48, and at decode a group
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index 1b81667..1e0913b 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -144,6 +144,10 @@ _COOP_SPLIT_MAX_GROUPS = 4
+ # 2.15 pack: coop split vs mixedk 1e-3 per layer on live weights, and against an fp32
+ # reference coop is the closer of the two (6.5e-4 vs 6.6e-4); larger batches keep mixedk.
+ _COOP_SPLIT_MAX_TOKENS = int(os.environ.get("VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "24"))
++# Mixed-K layers whose widths span two adjacent K (K <= 4) run decode on one exl3_moe_coop_mk
++# launch per stage instead of one exl3_moe_coop launch per K group (same batch bound);
++# VLLM_EXL3_COOP_MK=0 restores the per-group split launches.
++_COOP_MK = os.environ.get("VLLM_EXL3_COOP_MK", "1") == "1"
+ _COOP_PTR_NAMES = (
+     "gate_trellis", "gate_suh", "gate_svh",
+     "up_trellis", "up_suh", "up_svh",
+@@ -2832,6 +2836,33 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+                 _cpid = torch.full((n_exp + 1,), n_exp, dtype=torch.long, device=device)
+                 _cpid[_cperm] = torch.arange(n_exp, dtype=torch.long, device=device)
+                 layer._exl3_coop_pid = _cpid
++        # Mixed-K decode on one exl3_moe_coop_mk launch per stage: per-expert widths from the
++        # K arrays, every expert in one pointer table. Experts are renumbered in ascending
++        # K-tuple order (tables and K arrays permuted, router ids mapped through
++        # _exl3_coop_mk's id map at decode) so the kernel, which takes runs in descending
++        # expert order, starts the heavy experts first.
++        layer._exl3_coop_mk = None
++        _kvals = [_k for _kt, _ in layer._exl3_k_groups for _k in _kt]
++        if (
++            _COOP_MK
++            and not gateless
++            and max(_kvals) - min(_kvals) == 1
++            and min(_kvals) <= 3
++            and exllamav3_ext is not None
++            and hasattr(exllamav3_ext, "exl3_moe_coop_mk")
++        ):
++            _morder = [_e for _, _ids in layer._exl3_k_groups for _e in _ids]
++            if len(_morder) == n_exp:
++                _mperm = torch.tensor(_morder, dtype=torch.long, device=device)
++                _mpid = torch.full((n_exp + 1,), n_exp, dtype=torch.long, device=device)
++                _mpid[_mperm] = torch.arange(n_exp, dtype=torch.long, device=device)
++                layer._exl3_coop_mk = (
++                    min(_kvals),
++                    max(_kvals),
++                    tuple(layer._exl3_ptrs[_n][_mperm].contiguous() for _n in _COOP_PTR_NAMES),
++                    tuple(_k[_mperm].contiguous() for _k in (k_gate, k_up, k_down)),
++                    _mpid,
++                )
+         # Packed K-group dispatch (VLLM_EXL3_MIXEDK_PACKED=1). Renumber the
+         # experts into K-tuple order so group gi owns one contiguous packed range
+         # [lo, hi) and every launch can share a single globally sorted token
+@@ -2875,7 +2906,11 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+         layer._exl3_k_groups = None
+ 
+     if (
+-        (getattr(layer, "_exl3_coop_compat", False) or getattr(layer, "_exl3_coop_split", None))
++        (
++            getattr(layer, "_exl3_coop_compat", False)
++            or getattr(layer, "_exl3_coop_split", None)
++            or getattr(layer, "_exl3_coop_mk", None)
++        )
+         and device.type == "cuda"
+         and hidden % 128 == 0
+         and intermediate % 128 == 0
+@@ -3644,6 +3679,48 @@ def apply_exl3_fused_moe(
+             layer._exl3_last_apply = "coop"
+             return out
+ 
++    coop_mk = getattr(layer, "_exl3_coop_mk", None)
++    if (
++        _COOP
++        and coop_mk
++        and tokens <= _COOP_SPLIT_MAX_TOKENS
++        and tokens * topk <= _COOP_SLOTS_MAX
++        and tokens <= FAT_EXPERT_THRESHOLD
++        and tokens <= TEMP_ROWS_FUSED
++        and hasattr(exllamav3_ext, "exl3_moe_coop_mk")
++    ):
++        flags = getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS)
++        mcg, mul1 = bool(flags[0]), bool(flags[1])
++        inter_dim = int(temps[2].shape[-1])
++        if (
++            all(bool(flags[i]) == mcg and bool(flags[i + 1]) == mul1 for i in range(0, 6, 2))
++            and hidden % 128 == 0
++            and inter_dim % 128 == 0
++        ):
++            dev = x2d.device
++            k_lo, k_hi, mk_ptrs, mk_karr, mk_pid = coop_mk
++            # Router ids -> ascending-K ids; the n_exp sentinel stays out of [0, n_exp).
++            sel_p = mk_pid.index_select(0, local.reshape(-1).long()).reshape(tokens, topk).contiguous()
++            rw_c = weights.reshape(tokens, topk).to(dtype=torch.float16).contiguous()
++            had_g, had_u, gu_g, gu_u, act_out, d_out, ctr = _get_coop_temps(dev, hidden, inter_dim, tokens)
++            moe_act = getattr(layer, "_exl3_moe_act", None)
++            if moe_act is None:
++                moe_act = resolve_moe_act(layer)
++            out = torch.empty(tokens, hidden, dtype=torch.float32, device=dev)
++            exllamav3_ext.exl3_moe_coop_mk(
++                xh, sel_p, rw_c, 0, int(n_exp), hidden,
++                *mk_ptrs,
++                None, None, None,
++                *mk_karr, int(k_lo), int(k_hi),
++                mcg, mul1, moe_act,
++                float(limit) if (limit is not None and limit > 0) else 0.0,
++                True,
++                had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out,
++                None, None,
++            )
++            layer._exl3_last_apply = "coop_mk"
++            return out
++
+     coop_split = getattr(layer, "_exl3_coop_split", None)
+     if (
+         _COOP
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index 010c240..ce2e909 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -61,7 +61,7 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_FP8_PREFILL_SKIP", "VLLM_EXL3_BF16_PREFILL", "VLLM_EXL3_BF16_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_MIXEDK_M64_MIN_TOKENS",
+-    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "VLLM_EXL3_SPARSE_TILED", "VLLM_EXL3_SPARSE_TILED_MIN_ROWS", "VLLM_EXL3_FAT_THRESHOLD_PREFILL", "VLLM_EXL3_FAT_PREFILL_TOKENS", "VLLM_EXL3_SKIP_PROFILE_COMPUTE",
++    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "VLLM_EXL3_COOP_MK", "VLLM_EXL3_SPARSE_TILED", "VLLM_EXL3_SPARSE_TILED_MIN_ROWS", "VLLM_EXL3_FAT_THRESHOLD_PREFILL", "VLLM_EXL3_FAT_PREFILL_TOKENS", "VLLM_EXL3_SKIP_PROFILE_COMPUTE",
+ })
+ 
+ try:
+diff --git a/tests/test_moe_coop_mk_dispatch.py b/tests/test_moe_coop_mk_dispatch.py
+new file mode 100644
+index 0000000..5ce3e64
+--- /dev/null
++++ b/tests/test_moe_coop_mk_dispatch.py
+@@ -0,0 +1,133 @@
++"""CPU dispatch-contract tests for mixed-K decode on one exl3_moe_coop_mk launch.
++
++The real pack's mixed-K layers (K tuples (2,2,2), (2,2,3), (3,3,3)) decode on a single
++exl3_moe_coop_mk call: experts renumbered in ascending K-tuple order, the pointer tables and
++per-expert K arrays permuted with them, router ids mapped through the same permutation.
++VLLM_EXL3_COOP_MK=0 (exl3._COOP_MK) keeps the per-K-group exl3_moe_coop split launches.
++"""
++
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++import vllm_exl3.exl3 as exl3
++
++HIDDEN, INTER = 256, 128
++TUPLES = ((2, 2, 3), (3, 3, 3), (2, 2, 2), (2, 2, 3), (2, 2, 2), (3, 3, 3))
++N_EXP = len(TUPLES)
++PTR_NAMES = exl3._COOP_PTR_NAMES
++
++
++class _Recorder:
++    def __init__(self, name: str) -> None:
++        self.__name__ = name
++        self.calls: list[tuple] = []
++
++    def __call__(self, *args):
++        self.calls.append(args)
++
++
++def _mock_ext(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
++    ext = SimpleNamespace(
++        exl3_moe=_Recorder("exl3_moe"),
++        exl3_moe_coop=_Recorder("exl3_moe_coop"),
++        exl3_moe_coop_mk=_Recorder("exl3_moe_coop_mk"),
++        exl3_moe_mixedk=_Recorder("exl3_moe_mixedk"),
++        exl3_moe_max_concurrency=lambda _idx: 1,
++    )
++    monkeypatch.setattr(exl3, "load_exllamav3_ext", lambda: ext)
++    monkeypatch.setitem(sys.modules, "exllamav3_ext", ext)
++    monkeypatch.setattr(exl3, "get_moe_kernel_backend", lambda: "exllamav3")
++    return ext
++
++
++def _proj(k: int) -> SimpleNamespace:
++    return SimpleNamespace(
++        trellis=torch.empty(4, 4, 16 * k, dtype=torch.int16),
++        suh=torch.empty(4, 16 * k, dtype=torch.float16),
++        svh=torch.empty(4, 16 * k, dtype=torch.float16),
++    )
++
++
++def _layer():
++    inners = [{"gate": _proj(t[0]), "up": _proj(t[1]), "down": _proj(t[2])} for t in TUPLES]
++    layer = SimpleNamespace(
++        moe_config=SimpleNamespace(activation=SimpleNamespace(value="swigluoai_uninterleave")),
++        swiglu_alpha=exl3.MINIMAX_SWIGLU_ALPHA_DEFAULT,
++        swiglu_beta=1.0,
++        swiglu_limit=exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT,
++        w13_suh=torch.zeros(1, dtype=torch.float16),
++        _exl3_inners=inners,
++        _exl3_hidden_size=HIDDEN,
++        _exl3_intermediate_local=INTER,
++        _exl3_mixed_k=True,
++    )
++    return layer, inners
++
++
++def _decode(layer, tokens: int, topk: int):
++    ids = (torch.arange(tokens * topk) * 5 % N_EXP).reshape(tokens, topk).long()
++    weights = torch.ones(tokens, topk)
++    x = torch.zeros(tokens, HIDDEN, dtype=torch.float16)
++    exl3.apply_exl3_fused_moe(x, ids, weights, layer, layer._exl3_inners, None, exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT)
++    return ids
++
++
++def test_mixedk_decode_is_one_coop_mk_launch(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(exl3, "_COOP_MK", True)
++    ext = _mock_ext(monkeypatch)
++    layer, inners = _layer()
++    exl3.build_exl3_fused_state(layer, inners)
++    layer._exl3_codebook_flags = (False, True) * 3
++    ids = _decode(layer, 4, 2)
++
++    assert layer._exl3_last_apply == "coop_mk"
++    assert len(ext.exl3_moe_coop_mk.calls) == 1 and not ext.exl3_moe_coop.calls
++    call = ext.exl3_moe_coop_mk.calls[0]
++    sel = call[1]
++    assert call[3:6] == (0, N_EXP, HIDDEN)
++    ptrs = call[6:15]
++    kg, ku, kd = call[18:21]
++    assert call[21:23] == (2, 3)
++    assert call[25] == exl3.MOE_ACT_SWIGLU_OAI
++
++    # Ascending K-tuple numbering, heavy experts last (the kernel starts them first)
++    order = sorted(range(N_EXP), key=lambda e: (TUPLES[e], e))
++    for new_id, e in enumerate(order):
++        assert (int(kg[new_id]), int(ku[new_id]), int(kd[new_id])) == TUPLES[e]
++        for name, table in zip(PTR_NAMES, ptrs):
++            assert int(table[new_id]) == int(layer._exl3_ptrs[name][e])
++    # Router ids land on the renumbered expert carrying the same weights
++    for t in range(ids.shape[0]):
++        for j in range(ids.shape[1]):
++            assert order[int(sel[t, j])] == int(ids[t, j])
++
++
++def test_coop_mk_off_keeps_per_group_split(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(exl3, "_COOP_MK", False)
++    ext = _mock_ext(monkeypatch)
++    layer, inners = _layer()
++    exl3.build_exl3_fused_state(layer, inners)
++    layer._exl3_codebook_flags = (False, True) * 3
++    _decode(layer, 4, 2)
++
++    assert layer._exl3_last_apply == "coop_split"
++    assert not ext.exl3_moe_coop_mk.calls
++    assert [c[18:21] for c in ext.exl3_moe_coop.calls] == sorted(set(TUPLES))
++
++
++def test_k_range_wider_than_two_widths_stays_split(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(exl3, "_COOP_MK", True)
++    monkeypatch.setattr(sys.modules[__name__], "TUPLES", ((2, 2, 2), (2, 2, 4), (2, 2, 2), (2, 2, 4), (2, 2, 2), (2, 2, 2)))
++    ext = _mock_ext(monkeypatch)
++    layer, inners = _layer()
++    exl3.build_exl3_fused_state(layer, inners)
++    layer._exl3_codebook_flags = (False, True) * 3
++    _decode(layer, 4, 2)
++
++    assert layer._exl3_coop_mk is None
++    assert layer._exl3_last_apply == "coop_split"
++    assert not ext.exl3_moe_coop_mk.calls
+-- 
+2.51.0
+

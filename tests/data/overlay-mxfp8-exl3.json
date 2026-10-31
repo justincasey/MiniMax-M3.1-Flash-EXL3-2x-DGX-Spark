@@ -1,0 +1,82 @@
+{
+  "quantization_config": {
+    "non_routed_exl3": {
+      "bits": 8,
+      "codebook": "mul1",
+      "modules": [
+        "lm_head"
+      ]
+    },
+    "non_routed_quantization": {
+      "activation_scheme": "dynamic",
+      "ignored_layers": [
+        "lm_head",
+        "model.embed_tokens",
+        "model.layers.10.block_sparse_moe.gate",
+        "model.layers.11.block_sparse_moe.gate",
+        "model.layers.12.block_sparse_moe.gate",
+        "model.layers.13.block_sparse_moe.gate",
+        "model.layers.14.block_sparse_moe.gate",
+        "model.layers.15.block_sparse_moe.gate",
+        "model.layers.16.block_sparse_moe.gate",
+        "model.layers.17.block_sparse_moe.gate",
+        "model.layers.18.block_sparse_moe.gate",
+        "model.layers.19.block_sparse_moe.gate",
+        "model.layers.20.block_sparse_moe.gate",
+        "model.layers.21.block_sparse_moe.gate",
+        "model.layers.22.block_sparse_moe.gate",
+        "model.layers.23.block_sparse_moe.gate",
+        "model.layers.24.block_sparse_moe.gate",
+        "model.layers.25.block_sparse_moe.gate",
+        "model.layers.26.block_sparse_moe.gate",
+        "model.layers.27.block_sparse_moe.gate",
+        "model.layers.28.block_sparse_moe.gate",
+        "model.layers.29.block_sparse_moe.gate",
+        "model.layers.3.block_sparse_moe.gate",
+        "model.layers.30.block_sparse_moe.gate",
+        "model.layers.31.block_sparse_moe.gate",
+        "model.layers.32.block_sparse_moe.gate",
+        "model.layers.33.block_sparse_moe.gate",
+        "model.layers.34.block_sparse_moe.gate",
+        "model.layers.35.block_sparse_moe.gate",
+        "model.layers.36.block_sparse_moe.gate",
+        "model.layers.37.block_sparse_moe.gate",
+        "model.layers.38.block_sparse_moe.gate",
+        "model.layers.39.block_sparse_moe.gate",
+        "model.layers.4.block_sparse_moe.gate",
+        "model.layers.40.block_sparse_moe.gate",
+        "model.layers.41.block_sparse_moe.gate",
+        "model.layers.42.block_sparse_moe.gate",
+        "model.layers.43.block_sparse_moe.gate",
+        "model.layers.44.block_sparse_moe.gate",
+        "model.layers.45.block_sparse_moe.gate",
+        "model.layers.46.block_sparse_moe.gate",
+        "model.layers.47.block_sparse_moe.gate",
+        "model.layers.48.block_sparse_moe.gate",
+        "model.layers.49.block_sparse_moe.gate",
+        "model.layers.5.block_sparse_moe.gate",
+        "model.layers.50.block_sparse_moe.gate",
+        "model.layers.51.block_sparse_moe.gate",
+        "model.layers.52.block_sparse_moe.gate",
+        "model.layers.53.block_sparse_moe.gate",
+        "model.layers.54.block_sparse_moe.gate",
+        "model.layers.55.block_sparse_moe.gate",
+        "model.layers.56.block_sparse_moe.gate",
+        "model.layers.57.block_sparse_moe.gate",
+        "model.layers.58.block_sparse_moe.gate",
+        "model.layers.59.block_sparse_moe.gate",
+        "model.layers.6.block_sparse_moe.gate",
+        "model.layers.7.block_sparse_moe.gate",
+        "model.layers.8.block_sparse_moe.gate",
+        "model.layers.9.block_sparse_moe.gate"
+      ],
+      "quant_method": "mxfp8",
+      "weight_block_size": [
+        1,
+        32
+      ]
+    },
+    "quant_method": "exl3",
+    "version": "0.0.2"
+  }
+}

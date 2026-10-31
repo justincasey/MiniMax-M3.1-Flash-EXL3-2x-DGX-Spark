@@ -1,0 +1,89 @@
+From 1cee49eaade6b2507ecb90e838050c7c27fd35ea Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 09:51:10 -0500
+Subject: [PATCH] MiniMax-M3 EXL3 LM head: serve TP>1 by loading the full 8-bit
+ head per rank
+
+EXL3 rotates the output dimension in 128-row Hadamard blocks. MiniMax-M3.1's
+LM head has 200,064 rows; at TP=2 each rank would take 100,032 rows, which is
+not 128-aligned, and the plugin refuses the padded geometry under TP>1.
+
+Every rank now loads the whole head (8-bit, 1.15 GiB) and apply() returns this
+rank's vocab columns padded to num_embeddings_per_partition, so vLLM's logits
+gather is unchanged. Costs +0.57 GiB per node at TP=2.
+
+Based on tonyd2wild's tp2-minimax-lmhead.patch from
+MiniMax-M3.1-Flash-EXL3-TP2-2x-DGX-Spark (AGPL-3.0-only).
+---
+ src/vllm_exl3/exl3.py | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index d2be348..3e23c4e 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -1465,11 +1465,41 @@ def _narrow_tp(
+     return tensor.narrow(dim, chunk * tp_rank, chunk).contiguous()
+ 
+ 
++def _lm_head_full_vocab(layer, output_size: int) -> int | None:
++    """Full vocab rows for a ParallelLMHead under TP > 1, else None.
++
++    EXL3 rotates the output dim in 128-row Hadamard blocks, so a vocab split that is
++    not 128-aligned (MiniMax-M3: 200,064 / 2 = 100,032) cannot be served per rank.
++    Every rank loads the whole head instead and apply() keeps this rank's columns.
++    """
++    try:
++        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
++        from vllm.distributed import get_tensor_model_parallel_world_size
++    except ImportError:  # pragma: no cover
++        return None
++    if not isinstance(layer, ParallelLMHead) or get_tensor_model_parallel_world_size() <= 1:
++        return None
++    layer._exl3_lm_full = True
++    return int(output_size)
++
++
++def _lm_head_rank_slice(layer, y: torch.Tensor) -> torch.Tensor:
++    """This rank's vocab partition of full-head logits, padded to num_embeddings_per_partition."""
++    si = layer.shard_indices
++    part = y[..., si.org_vocab_start_index : si.org_vocab_end_index]
++    width = int(layer.num_embeddings_per_partition)
++    if part.shape[-1] < width:
++        part = torch.nn.functional.pad(part, (0, width - part.shape[-1]))
++    return part.contiguous()
++
++
+ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
+     """Resolve per-layer TP metadata before consulting process-wide TP state."""
+     for owner in owners:
+         if owner is None:
+             continue
++        if getattr(owner, "_exl3_lm_full", False):
++            return 0, 1  # full-vocab LM head under TP: every rank loads the whole head
+         rank = getattr(owner, "tp_rank", None)
+         size = getattr(owner, "moe_tp_size", None)
+         if size is None:
+@@ -5864,6 +5894,10 @@ class Exl3LinearMethod(LinearMethodBase):
+         )
+         from vllm.distributed import get_tensor_model_parallel_world_size
+ 
++        lm_full = _lm_head_full_vocab(layer, output_size)
++        if lm_full is not None:
++            output_partition_sizes = [lm_full]
++
+         # Determine layer type and shard behavior
+         n_shards = len(output_partition_sizes)
+         is_row_parallel = isinstance(layer, RowParallelLinear)
+@@ -6651,6 +6685,8 @@ class Exl3LinearMethod(LinearMethodBase):
+             y = self._apply_impl(layer, x)
+         if bias is not None:
+             y = y + bias
++        if getattr(layer, "_exl3_lm_full", False):
++            y = _lm_head_rank_slice(layer, y)
+         return y
+ 
+     def _apply_impl(self, layer, x: torch.Tensor) -> torch.Tensor:
+-- 
+2.51.0
+

@@ -1,0 +1,732 @@
+From a451d49bce347477169cd0ca8d69a6114def7f93 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 13:38:03 -0500
+Subject: [PATCH] Per-rank snapshots of the loaded weights
+ (VLLM_EXL3_WEIGHT_SNAPSHOT=1)
+
+Loading MiniMax-M3.1 EXL3 at TP=2 spends ~120-150 s per rank in per-tensor
+Python (~90,000 tensors), not in bytes. With VLLM_EXL3_WEIGHT_SNAPSHOT=1 the
+first boot of a configuration writes every CUDA storage behind the model's
+parameters and buffers (plus tensors the load parks in module attributes,
+such as the MiniMax indexer payloads) to one O_DIRECT file per rank with a
+CRC32 per 64 MiB chunk; later boots plan the trellis arenas the way the
+loader does, require an identical layout, read the storages back and replay
+the plain attributes, then run process_weights_after_loading as usual.
+
+Fail-closed: a missing, stale or mismatched snapshot loads the checkpoint, a
+CRC failure deletes the snapshot and loads the checkpoint, and a load with
+side effects that cannot be replayed writes no snapshot. The key covers the
+checkpoint files, the serve config, the plugin sources, torch/vLLM/exllamav3,
+every VLLM_EXL3_*/EXL3_* variable, the TP rank and size, the device and
+VLLM_EXL3_WEIGHT_SNAPSHOT_TAG. The idea follows the processed-weight snapshots
+of kindlingai/glm-5.3-flash-gx10 and the author's earlier DGX Spark recipe;
+no code is shared.
+---
+ src/vllm_exl3/__init__.py        |   6 +
+ src/vllm_exl3/weight_snapshot.py | 677 +++++++++++++++++++++++++++++++
+ 2 files changed, 683 insertions(+)
+ create mode 100644 src/vllm_exl3/weight_snapshot.py
+
+diff --git a/src/vllm_exl3/__init__.py b/src/vllm_exl3/__init__.py
+index 6b6d91c..17a19e9 100644
+--- a/src/vllm_exl3/__init__.py
++++ b/src/vllm_exl3/__init__.py
+@@ -94,6 +94,12 @@ def register() -> None:
+ 
+     install_uma_load_memory(exl3)
+ 
++    # Per-rank snapshots of the loaded weights. Inert unless
++    # VLLM_EXL3_WEIGHT_SNAPSHOT=1 (see weight_snapshot.py).
++    from .weight_snapshot import install_weight_snapshot
++
++    install_weight_snapshot()
++
+     # Standalone-saved NemotronH VL packs (text model saved under backbone.*
+     # instead of language_model.backbone.*) need the name-rewriting loader.
+     # Importing registers the load format; runs are started with
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+new file mode 100644
+index 0000000..e928dcb
+--- /dev/null
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -0,0 +1,677 @@
++"""Per-rank snapshots of the loaded weights (``VLLM_EXL3_WEIGHT_SNAPSHOT=1``).
++
++Loading an EXL3 MoE checkpoint is dominated by per-tensor Python work (name
++mapping, TP narrowing and one copy per expert tensor: ~90,000 tensors for
++MiniMax-M3.1), not by bytes. A snapshot keeps the result instead of redoing it:
++
++* First boot of a configuration: the normal ``load_weights`` runs; afterwards
++  every CUDA storage behind the model's parameters and buffers is written to
++  one file per rank with O_DIRECT, with a CRC32 per 64 MiB chunk, a manifest of
++  the tensor layout, and the plain-data module attributes the load set.
++* Later boots: the model is built as usual, the EXL3 trellis arenas are planned
++  exactly as the loader plans them, and if the resulting layout is identical to
++  the manifest, every storage is read back (O_DIRECT, pinned bounce, several
++  threads) and the plain attributes are replayed. ``process_weights_after_loading``
++  then runs normally on bit-identical inputs.
++* Fail-closed: a missing, stale or mismatched snapshot loads the checkpoint; a
++  chunk whose CRC32 fails is fatal for that snapshot (it is deleted) and the
++  checkpoint is loaded. A load with side effects this module cannot replay
++  (non-plain attributes outside the known arena keys, non-CUDA storages)
++  writes no snapshot.
++
++The key covers the checkpoint files (name, size, mtime), the serve config, the
++plugin sources, torch/vLLM/exllamav3 versions, every ``VLLM_EXL3_*``/``EXL3_*``
++variable, the TP rank and size, the device and ``VLLM_EXL3_WEIGHT_SNAPSHOT_TAG``.
++
++Knobs: ``VLLM_EXL3_WEIGHT_SNAPSHOT_DIR`` (default ``/cache/weight-snapshots``),
++``VLLM_EXL3_WEIGHT_SNAPSHOT_TAG``, ``VLLM_EXL3_WEIGHT_SNAPSHOT_THREADS`` (4),
++``VLLM_EXL3_WEIGHT_SNAPSHOT_ARCHS`` (comma list; default the MiniMax-M3 target).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import shutil
++import threading
++import time
++import zlib
++from concurrent.futures import ThreadPoolExecutor
++from functools import wraps
++from typing import Any
++
++FORMAT = 1
++ALIGN = 4096
++CHUNK = 64 << 20
++# Attributes prepare_trellis_arena_plan creates; the restore reproduces them by
++# calling it, so they are not replayed.
++ARENA_KEYS = frozenset({
++    "_exl3_trellis_arena_plan", "_exl3_trellis_eid_index", "_exl3_trellis_staging",
++    "_exl3_trellis_arena_stats", "_exl3_trellis_shapes_pending",
++    "_exl3_gate_trellis_arenas", "_exl3_up_trellis_arenas", "_exl3_down_trellis_arenas",
++})
++DEFAULT_ARCHS = "MiniMaxM3SparseForConditionalGeneration"
++# Read only by the forward pass (MoE dispatch), never by load_weights: the
++# snapshot is taken before process_weights_after_loading, so these cannot change
++# what it holds and must not invalidate it.
++APPLY_ONLY_ENV = frozenset({
++    "VLLM_EXL3_MOE_TEMP_ROWS", "VLLM_EXL3_FAT_THRESHOLD", "VLLM_EXL3_PERIODIC_TRIM_S",
++    "VLLM_EXL3_MIXEDK_MODE", "VLLM_EXL3_PREFILL_SYNC", "VLLM_EXL3_RECONSTRUCT_MIN_ROWS",
++    "VLLM_EXL3_MOE_LPT", "VLLM_EXL3_COOP", "VLLM_EXL3_COOP_GEMM",
++})
++
++try:
++    from vllm.logger import init_logger
++
++    logger = init_logger("vllm." + __name__)
++except Exception:  # pragma: no cover - offline tooling
++    import logging
++
++    logger = logging.getLogger(__name__)
++
++
++class SnapshotUnusable(Exception):
++    pass
++
++
++def enabled() -> bool:
++    return os.environ.get("VLLM_EXL3_WEIGHT_SNAPSHOT", "0") == "1"
++
++
++def _align(n: int) -> int:
++    return (n + ALIGN - 1) // ALIGN * ALIGN
++
++
++def _gib(n: int) -> float:
++    return n / 2**30
++
++
++# ── plain-data attribute encoding (tuples and int keys survive JSON) ─────────
++def _plain(v: Any, depth: int = 0) -> bool:
++    if depth > 6:
++        return False
++    if v is None or isinstance(v, (bool, int, float, str)):
++        return True
++    if isinstance(v, (list, tuple)):
++        return all(_plain(x, depth + 1) for x in v)
++    if isinstance(v, dict):
++        return all(isinstance(k, (str, int)) and _plain(x, depth + 1) for k, x in v.items())
++    return False
++
++
++def _enc(v: Any) -> Any:
++    if isinstance(v, tuple):
++        return {"t": [_enc(x) for x in v]}
++    if isinstance(v, list):
++        return {"l": [_enc(x) for x in v]}
++    if isinstance(v, dict):
++        return {"d": [[_enc(k), _enc(x)] for k, x in v.items()]}
++    return {"v": v}
++
++
++def _dec(e: Any) -> Any:
++    if "t" in e:
++        return tuple(_dec(x) for x in e["t"])
++    if "l" in e:
++        return [_dec(x) for x in e["l"]]
++    if "d" in e:
++        return {_dec(k): _dec(x) for k, x in e["d"]}
++    return e["v"]
++
++
++def _tensor_container(v: Any, depth: int = 0) -> bool:
++    """Plain data and tensors, nested in lists/tuples/dicts (and at least one tensor)."""
++    import torch
++
++    def ok(x: Any, d: int) -> bool:
++        if d > 6:
++            return False
++        if torch.is_tensor(x) or x is None or isinstance(x, (bool, int, float, str)):
++            return True
++        if isinstance(x, (list, tuple)):
++            return all(ok(y, d + 1) for y in x)
++        if isinstance(x, dict):
++            return all(isinstance(k, (str, int)) and ok(y, d + 1) for k, y in x.items())
++        return False
++
++    def has(x: Any) -> bool:
++        if torch.is_tensor(x):
++            return True
++        if isinstance(x, (list, tuple)):
++            return any(has(y) for y in x)
++        if isinstance(x, dict):
++            return any(has(y) for y in x.values())
++        return False
++
++    return ok(v, depth) and has(v)
++
++
++def _fingerprint(v: Any) -> str:
++    import torch
++
++    def fp(x: Any) -> Any:
++        if torch.is_tensor(x):
++            return ["T", id(x), int(x.data_ptr()), list(x.shape), str(x.dtype)]
++        if isinstance(x, (list, tuple)):
++            return [type(x).__name__] + [fp(y) for y in x]
++        if isinstance(x, dict):
++            return ["dict"] + [[str(k), fp(y)] for k, y in x.items()]
++        return repr(x)
++
++    return json.dumps(fp(v))
++
++
++def _dtype(name: str) -> Any:
++    import torch
++
++    return getattr(torch, name.split(".", 1)[1])
++
++
++def _enc_t(v: Any, index: dict[tuple[int, int], int], blobs: list[Any]) -> Any:
++    """Encode a tensor container: views of parameter storages by reference, others as blobs."""
++    import torch
++
++    if torch.is_tensor(v):
++        st = v.untyped_storage()
++        key = (int(st.data_ptr()), int(st.nbytes()))
++        if key in index:
++            return {"S": [index[key], int(v.storage_offset()), list(v.shape), list(v.stride()), str(v.dtype)]}
++        blobs.append(v.detach().contiguous())
++        return {"B": len(blobs) - 1}
++    if isinstance(v, tuple):
++        return {"t": [_enc_t(x, index, blobs) for x in v]}
++    if isinstance(v, list):
++        return {"l": [_enc_t(x, index, blobs) for x in v]}
++    if isinstance(v, dict):
++        return {"d": [[_enc(k), _enc_t(x, index, blobs)] for k, x in v.items()]}
++    return {"v": v}
++
++
++def _dec_t(e: Any, storages: list[Any], blobs: list[Any]) -> Any:
++    import torch
++
++    if "S" in e:
++        sid, off, shape, stride, dt = e["S"]
++        st = storages[sid]
++        return torch.empty(0, dtype=_dtype(dt), device=st.device).set_(st, off, shape, stride)
++    if "B" in e:
++        return blobs[e["B"]]
++    if "t" in e:
++        return tuple(_dec_t(x, storages, blobs) for x in e["t"])
++    if "l" in e:
++        return [_dec_t(x, storages, blobs) for x in e["l"]]
++    if "d" in e:
++        return {_dec(k): _dec_t(x, storages, blobs) for k, x in e["d"]}
++    return e["v"]
++
++
++def _blob_bytes(t: Any) -> Any:
++    import torch
++
++    return t.reshape(-1).view(torch.uint8)
++
++
++class LoadProbe:
++    """Module attributes before the load, to find what the load changed."""
++
++    def __init__(self, model: Any):
++        self.before = {name: self._state(m) for name, m in model.named_modules()}
++
++    @staticmethod
++    def _state(m: Any) -> dict[str, tuple[str, Any]]:
++        out = {}
++        for k, v in vars(m).items():
++            if k in ("_parameters", "_buffers", "_modules") or k.startswith("__"):
++                continue
++            if _plain(v):
++                out[k] = ("plain", json.dumps(_enc(v), sort_keys=True))
++            elif _tensor_container(v):
++                # By content, so a container mutated in place still shows as changed.
++                out[k] = ("tc", _fingerprint(v))
++            else:
++                out[k] = ("obj", id(v))
++        return out
++
++    def changes(self, model: Any) -> tuple[list[list[Any]], list[list[Any]], list[str]]:
++        """(plain replays, tensor-container attributes, blocked attribute names)."""
++        replay: list[list[Any]] = []
++        tattrs: list[list[Any]] = []
++        blocked: list[str] = []
++        for name, m in model.named_modules():
++            before = self.before.get(name)
++            if before is None:
++                blocked.append(f"{name} (module created by the load)")
++                continue
++            for k, v in self._state(m).items():
++                if before.get(k) == v or k in ARENA_KEYS:
++                    continue
++                if v[0] == "plain":
++                    replay.append([name, k, json.loads(v[1])])
++                elif _tensor_container(getattr(m, k)):
++                    tattrs.append([name, k, getattr(m, k)])
++                else:
++                    blocked.append(f"{name}.{k} ({type(getattr(m, k)).__name__})")
++        return replay, tattrs, blocked
++
++
++# ── layout: every tensor's (storage, offset, shape, stride, dtype) ───────────
++def _layout(model: Any) -> tuple[list[Any], list[list[Any]], dict[tuple[int, int], int]]:
++    storages: list[Any] = []
++    index: dict[tuple[int, int], int] = {}
++    entries: list[list[Any]] = []
++
++    def add(kind: str, name: str, t: Any) -> None:
++        if t is None:
++            return
++        if t.device.type not in ("cuda", "cpu"):
++            raise SnapshotUnusable(f"{name} is on {t.device}")
++        st = t.untyped_storage()
++        nbytes = int(st.nbytes())
++        sid = -1
++        if nbytes:
++            key = (int(st.data_ptr()), nbytes)
++            if key not in index:
++                index[key] = len(storages)
++                storages.append(st)
++            sid = index[key]
++        entries.append([kind, name, sid, int(t.storage_offset()), list(t.shape), list(t.stride()), str(t.dtype)])
++
++    for n, p in model.named_parameters(remove_duplicate=False):
++        add("p", n, p)
++    for n, b in model.named_buffers(remove_duplicate=False):
++        add("b", n, b)
++    spans = sorted((int(st.data_ptr()), int(st.data_ptr()) + int(st.nbytes())) for st in storages)
++    for (a0, a1), (b0, _) in zip(spans, spans[1:]):
++        if b0 < a1:
++            raise SnapshotUnusable("two storages overlap in memory")
++    return storages, entries, index
++
++
++def _u8(st: Any) -> Any:
++    import torch
++
++    return torch.empty(0, dtype=torch.uint8, device=st.device).set_(st, 0, (int(st.nbytes()),), (1,))
++
++
++def _pinned_aligned(n: int) -> tuple[Any, memoryview]:
++    """A pinned host buffer of n bytes at a 4 KiB-aligned address (O_DIRECT)."""
++    import torch
++
++    raw = torch.empty(n + ALIGN, dtype=torch.uint8, pin_memory=True)
++    off = (-int(raw.data_ptr())) % ALIGN
++    buf = raw[off:off + n]
++    return buf, memoryview(buf.numpy())
++
++
++def _file_sig(path: str) -> list[Any]:
++    """Shards by size and mtime; small JSON files by content (the serve config is
++    rewritten, with a new mtime, at every start)."""
++    s = os.stat(path)
++    if path.endswith(".json"):
++        with open(path, "rb") as fh:
++            return [os.path.basename(path), hashlib.sha256(fh.read()).hexdigest()]
++    return [os.path.basename(path), int(s.st_size), int(s.st_mtime_ns)]
++
++
++def _key(model: Any, model_config: Any) -> tuple[str, dict[str, Any]]:
++    import torch
++
++    from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
++
++    model_dir = str(model_config.model)
++    files = sorted(
++        _file_sig(os.path.join(model_dir, f))
++        for f in os.listdir(model_dir)
++        if f.endswith((".safetensors", ".json"))
++    )
++    pkg = os.path.dirname(os.path.abspath(__file__))
++    src = hashlib.sha256()
++    for root, _dirs, names in sorted(os.walk(pkg)):
++        for f in sorted(names):
++            if f.endswith(".py"):
++                with open(os.path.join(root, f), "rb") as fh:
++                    src.update(f.encode() + b"\0" + fh.read())
++    versions = {"torch": torch.__version__}
++    for mod in ("vllm", "exllamav3"):
++        try:
++            versions[mod] = __import__(mod).__version__
++        except Exception:
++            versions[mod] = "?"
++    env = {
++        k: v for k, v in sorted(os.environ.items())
++        if k.startswith(("VLLM_EXL3_", "EXL3_")) and not k.startswith("VLLM_EXL3_WEIGHT_SNAPSHOT")
++        and k not in APPLY_ONLY_ENV
++    }
++    factors = {
++        "format": FORMAT,
++        "arch": type(model).__name__,
++        "rank": int(get_tensor_model_parallel_rank()),
++        "world": int(get_tensor_model_parallel_world_size()),
++        "dtype": str(model_config.dtype),
++        "files": files,
++        "plugin": src.hexdigest(),
++        "versions": versions,
++        "env": env,
++        "device": torch.cuda.get_device_name(),
++        "tag": os.environ.get("VLLM_EXL3_WEIGHT_SNAPSHOT_TAG", ""),
++    }
++    return hashlib.sha256(json.dumps(factors, sort_keys=True).encode()).hexdigest()[:24], factors
++
++
++class Snapshot:
++    def __init__(self, model: Any, model_config: Any):
++        self.key, self.factors = _key(model, model_config)
++        self.rank = self.factors["rank"]
++        self.root = os.environ.get("VLLM_EXL3_WEIGHT_SNAPSHOT_DIR", "/cache/weight-snapshots")
++        self.dir = os.path.join(self.root, self.key)
++        self.base = os.path.join(self.dir, f"rank{self.rank}")
++        self.threads = max(1, int(os.environ.get("VLLM_EXL3_WEIGHT_SNAPSHOT_THREADS", "4")))
++
++    @staticmethod
++    def for_model(model: Any, model_config: Any) -> "Snapshot | None":
++        if not enabled():
++            return None
++        archs = {a.strip() for a in os.environ.get("VLLM_EXL3_WEIGHT_SNAPSHOT_ARCHS", DEFAULT_ARCHS).split(",")}
++        if type(model).__name__ not in archs:
++            return None
++        try:
++            return Snapshot(model, model_config)
++        except Exception as exc:
++            logger.warning("EXL3 weight snapshot disabled for this load: %r", exc)
++            return None
++
++    def _chunks(self, sizes: list[int]) -> list[tuple[int, int, int, int]]:
++        """(storage index, start, nbytes, file offset) per CHUNK-sized piece."""
++        out, off = [], 0
++        for sid, nbytes in enumerate(sizes):
++            for start in range(0, nbytes, CHUNK):
++                out.append((sid, start, min(CHUNK, nbytes - start), off + start))
++            off += _align(nbytes)
++        return out
++
++    def _drop(self, why: str) -> None:
++        logger.warning("EXL3 weight snapshot %s deleted: %s", self.base, why)
++        for ext in (".done", ".json", ".bin"):
++            try:
++                os.unlink(self.base + ext)
++            except FileNotFoundError:
++                pass
++
++    # ── restore ──────────────────────────────────────────────────────────────
++    def restore(self, model: Any) -> bool:
++        if not os.path.exists(self.base + ".done"):
++            logger.info("EXL3 weight snapshot: none for key %s (rank %d); loading the checkpoint", self.key, self.rank)
++            return False
++        t0 = time.perf_counter()
++        try:
++            with open(self.base + ".json") as fh:
++                manifest = json.load(fh)
++            if manifest.get("format") != FORMAT or manifest.get("key") != self.key:
++                raise SnapshotUnusable("manifest key/format mismatch")
++            from . import exl3
++
++            # The loader plans each MoE layer's arenas on its first trellis load;
++            # plan them the same way (without the UMA per-layer trim wrapper:
++            # nothing has been loaded, so there is nothing to trim).
++            plan = getattr(exl3.prepare_trellis_arena_plan, "__wrapped__", exl3.prepare_trellis_arena_plan)
++            for m in model.modules():
++                pending = getattr(m, "_exl3_trellis_shapes_pending", None)
++                if pending is not None and getattr(m, "_exl3_trellis_arena_plan", None) is None:
++                    plan(m, pending)
++                    m._exl3_trellis_shapes_pending = None
++            storages, entries, _ = _layout(model)
++            snap_storages, replaced = self._match(model, storages, entries, manifest)
++        except SnapshotUnusable as exc:
++            logger.warning("EXL3 weight snapshot not used (%s); loading the checkpoint", exc)
++            return False
++        except Exception as exc:
++            logger.warning("EXL3 weight snapshot not used (%r); loading the checkpoint", exc)
++            return False
++
++        import torch
++
++        # Resolve every owner before anything is mutated: a name that does not
++        # resolve must leave the model untouched for the checkpoint load.
++        mods = dict(model.named_modules(remove_duplicate=False))
++        try:
++            for _kind, name, *_ in replaced:
++                owner = name.rpartition(".")[0]
++                if owner not in mods:
++                    raise SnapshotUnusable(f"no module {owner!r}")
++            for name, _k, _v in list(manifest["tattrs"]) + list(manifest["replay"]):
++                if name not in mods:
++                    raise SnapshotUnusable(f"no module {name!r}")
++        except SnapshotUnusable as exc:
++            logger.warning("EXL3 weight snapshot not used (%s); loading the checkpoint", exc)
++            return False
++
++        blobs = [torch.empty(shape, dtype=_dtype(dt), device=dev) for dev, dt, shape in manifest["blobs"]]
++        dst = [_u8(st) for st in snap_storages] + [_blob_bytes(b) for b in blobs]
++        sizes = [int(t.numel()) for t in dst]
++        if sizes != manifest["sizes"]:
++            logger.warning("EXL3 weight snapshot not used (blob sizes differ); loading the checkpoint")
++            return False
++        try:
++            self._read(dst, sizes, manifest["crc32"])
++        except Exception as exc:
++            self._drop(f"read failed: {exc!r}")
++            return False
++
++        plan_apply = []
++        for kind, name, sid, off, shape, stride, dt in replaced:
++            def repoint(kind=kind, name=name, sid=sid, off=off, shape=shape, stride=stride, dt=dt):
++                st = snap_storages[sid]
++                t = torch.empty(0, dtype=_dtype(dt), device=st.device).set_(st, off, shape, stride)
++                owner, _, leaf = name.rpartition(".")
++                if kind == "p":
++                    getattr(mods[owner], leaf).data = t  # same Parameter object, as the loader does
++                else:
++                    mods[owner]._buffers[leaf] = t
++            plan_apply.append(repoint)
++        for name, k, v in manifest["tattrs"]:
++            plan_apply.append(lambda name=name, k=k, v=v: setattr(mods[name], k, _dec_t(v, snap_storages, blobs)))
++        for name, k, v in manifest["replay"]:
++            plan_apply.append(lambda name=name, k=k, v=v: setattr(mods[name], k, _dec(v)))
++        try:
++            for apply in plan_apply:
++                apply()
++        except Exception as exc:
++            # Storages and attributes are partly restored: a checkpoint load on top
++            # of that is not safe, so fail this boot and make the next one load cleanly.
++            self._drop(f"applying the restore failed: {exc!r}")
++            raise
++        total = sum(sizes)
++        dt = time.perf_counter() - t0
++        logger.info(
++            "EXL3 weight snapshot restored: %d storages + %d blobs, %.2f GiB in %.2f s (%.1f GB/s), "
++            "%d plain and %d tensor attributes",
++            len(snap_storages), len(blobs), _gib(total), dt, total / dt / 1e9, len(manifest["replay"]),
++            len(manifest["tattrs"]),
++        )
++        return True
++
++    def _match(self, model: Any, storages: list[Any], entries: list[list[Any]], manifest: dict[str, Any]):
++        """Map the snapshot's storages onto the freshly built model.
++
++        Returns (storage per snapshot index, entries the load re-pointed). A tensor
++        whose layout equals the snapshot's maps its storage one-to-one; a tensor
++        that is still the empty placeholder the loader replaces (``param.data =
++        payload``) gets a fresh storage on the recorded device, provided no
++        unchanged tensor shares that snapshot storage. Anything else refuses.
++        """
++        import torch
++
++        snap = manifest["entries"]
++        if [e[:2] for e in entries] != [e[:2] for e in snap]:
++            raise SnapshotUnusable(f"tensor names differ ({len(entries)} vs {len(snap)})")
++        n_st = len(manifest["devices"])
++        mapped: dict[int, Any] = {}
++        replaced: list[list[Any]] = []
++        for cur, old in zip(entries, snap):
++            if cur[3:] == old[3:] and (cur[2] < 0) == (old[2] < 0):
++                if old[2] < 0:
++                    continue
++                st = storages[cur[2]]
++                prev = mapped.setdefault(old[2], st)
++                if prev is not st or int(st.nbytes()) != manifest["sizes"][old[2]]:
++                    raise SnapshotUnusable(f"storage of {cur[1]} differs")
++            elif cur[2] < 0 and old[2] >= 0:
++                replaced.append(old)
++            else:
++                raise SnapshotUnusable(f"layout of {cur[1]} differs: {cur[3:]} vs {old[3:]}")
++        for old in replaced:
++            if old[2] in mapped:
++                raise SnapshotUnusable(f"{old[1]} shares a storage with an unchanged tensor")
++        out = []
++        for sid in range(n_st):
++            if sid in mapped:
++                out.append(mapped[sid])
++            else:
++                dev = torch.device(manifest["devices"][sid])
++                out.append(torch.empty(manifest["sizes"][sid], dtype=torch.uint8, device=dev).untyped_storage())
++        return out, replaced
++
++    def _read(self, dst: list[Any], sizes: list[int], crcs: list[int]) -> None:
++        import torch
++
++        chunks = self._chunks(sizes)
++        if len(chunks) != len(crcs):
++            raise SnapshotUnusable("chunk count differs from the manifest")
++        fd = os.open(self.base + ".bin", os.O_RDONLY | getattr(os, "O_DIRECT", 0))
++        local = threading.local()
++
++        def work(i: int) -> None:
++            if not hasattr(local, "buf"):
++                local.buf, local.view = _pinned_aligned(CHUNK)
++                local.stream = torch.cuda.Stream()
++            sid, start, n, off = chunks[i]
++            want = _align(n)
++            got = os.preadv(fd, [local.view[:want]], off)
++            if got < n:
++                raise IOError(f"short read at {off}: {got} < {n}")
++            if zlib.crc32(local.view[:n]) != crcs[i]:
++                raise IOError(f"CRC32 mismatch in storage {sid} at byte {start}")
++            with torch.cuda.stream(local.stream):
++                dst[sid][start:start + n].copy_(local.buf[:n], non_blocking=True)
++            local.stream.synchronize()
++
++        try:
++            with ThreadPoolExecutor(self.threads) as pool:
++                list(pool.map(work, range(len(chunks))))
++        finally:
++            os.close(fd)
++
++    # ── write ────────────────────────────────────────────────────────────────
++    def write(self, model: Any, probe: LoadProbe) -> None:
++        import torch
++
++        t0 = time.perf_counter()
++        try:
++            replay, tattr_objs, blocked = probe.changes(model)
++            if blocked:
++                kinds = sorted({b.split(".", 1)[-1] if "." in b else b for b in
++                                (x.rsplit(".", 1)[-1] for x in blocked)})
++                raise SnapshotUnusable(
++                    f"the load set {len(blocked)} attributes that cannot be replayed "
++                    f"(keys: {kinds[:12]}; first: {blocked[:3]})"
++                )
++            storages, entries, index = _layout(model)
++        except SnapshotUnusable as exc:
++            logger.warning("EXL3 weight snapshot not written: %s", exc)
++            return
++        blobs: list[Any] = []
++        tattrs = [[name, k, _enc_t(v, index, blobs)] for name, k, v in tattr_objs]
++        src = [_u8(st) for st in storages] + [_blob_bytes(b) for b in blobs]
++        sizes = [int(t.numel()) for t in src]
++        total = sum(_align(s) for s in sizes)
++        os.makedirs(self.dir, exist_ok=True)
++        free = shutil.disk_usage(self.dir).free
++        if free < total + (4 << 30):
++            logger.warning("EXL3 weight snapshot not written: %.1f GiB free, need %.1f GiB", _gib(free), _gib(total) + 4)
++            return
++        torch.cuda.synchronize()
++        chunks = self._chunks(sizes)
++        crcs = [0] * len(chunks)
++        tmp = self.base + ".bin.tmp"
++        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_DIRECT", 0), 0o600)
++        local = threading.local()
++
++        def work(i: int) -> None:
++            if not hasattr(local, "buf"):
++                local.buf, local.view = _pinned_aligned(CHUNK)
++                local.stream = torch.cuda.Stream()
++            sid, start, n, off = chunks[i]
++            with torch.cuda.stream(local.stream):
++                local.buf[:n].copy_(src[sid][start:start + n], non_blocking=True)
++            local.stream.synchronize()
++            want = _align(n)
++            if want > n:
++                local.buf[n:want].zero_()
++            crcs[i] = zlib.crc32(local.view[:n])
++            if os.pwritev(fd, [local.view[:want]], off) != want:
++                raise IOError(f"short write at {off}")
++
++        try:
++            with ThreadPoolExecutor(self.threads) as pool:
++                list(pool.map(work, range(len(chunks))))
++            os.fsync(fd)
++        except Exception as exc:
++            os.close(fd)
++            os.unlink(tmp)
++            logger.warning("EXL3 weight snapshot not written: %r", exc)
++            return
++        os.close(fd)
++        manifest = {
++            "format": FORMAT, "key": self.key, "factors": self.factors, "sizes": sizes,
++            "entries": entries, "crc32": crcs, "replay": replay, "tattrs": tattrs,
++            "devices": [str(st.device) for st in storages],
++            "blobs": [[str(b.device), str(b.dtype), list(b.shape)] for b in blobs],
++        }
++        with open(self.base + ".json.tmp", "w") as fh:
++            json.dump(manifest, fh)
++            fh.flush()
++            os.fsync(fh.fileno())
++        os.replace(tmp, self.base + ".bin")
++        os.replace(self.base + ".json.tmp", self.base + ".json")
++        with open(self.base + ".done", "w") as fh:
++            fh.write(self.key + "\n")
++        # Keep one snapshot per rank: drop this rank's files under other keys.
++        for other in os.listdir(self.root):
++            if other != self.key:
++                for ext in (".done", ".json", ".bin", ".bin.tmp", ".json.tmp"):
++                    try:
++                        os.unlink(os.path.join(self.root, other, f"rank{self.rank}{ext}"))
++                    except FileNotFoundError:
++                        pass
++        dt = time.perf_counter() - t0
++        logger.info(
++            "EXL3 weight snapshot written: %s, %d storages + %d blobs, %.2f GiB in %.2f s, "
++            "%d plain and %d tensor attributes",
++            self.base, len(storages), len(blobs), _gib(sum(sizes)), dt, len(replay), len(tattrs),
++        )
++
++
++def install_weight_snapshot() -> None:
++    """Wrap DefaultModelLoader.load_weights (idempotent)."""
++    try:
++        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++    except Exception:
++        return
++    orig = DefaultModelLoader.load_weights
++    if getattr(orig, "_exl3_weight_snapshot", False):
++        return
++
++    @wraps(orig)
++    def load_weights(self, model, model_config):
++        snap = Snapshot.for_model(model, model_config)
++        if snap is None:
++            return orig(self, model, model_config)
++        if snap.restore(model):
++            return None
++        probe = LoadProbe(model)
++        result = orig(self, model, model_config)
++        snap.write(model, probe)
++        return result
++
++    load_weights._exl3_weight_snapshot = True
++    DefaultModelLoader.load_weights = load_weights
+-- 
+2.51.0
+

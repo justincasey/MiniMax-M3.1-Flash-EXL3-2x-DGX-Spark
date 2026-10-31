@@ -1,0 +1,57 @@
+MiniMax-M3.1-Flash EXL3 2.15 bpw TP=2 DGX Spark recipe
+Copyright 2026 Justin Casey
+
+The scripts, configuration and documentation of this repository are licensed
+under Apache-2.0 (LICENSE), except for the files listed below, which keep the
+license of the project they belong to or patch.
+
+Engine sources, not included here: the build fetches these pinned commits and
+copies them, with the patches below, into the image it makes. Each carries the
+project's own license and notice files:
+
+- vllm-exl3 by vcruz305 (https://github.com/vcruz305/vllm-exl3) at
+  053c634db54afc981becfb46c0482e7358cc00ba. AGPL-3.0-only as a whole. It
+  contains and derives from MIT-licensed work by Mia's AI Lab (@MiaAI-Lab,
+  @plotarmordev; the fat-GEMM CUDA kernels and the routed-expert EXL3 serving
+  path) and by turboderp (ExLlamaV3). Its NOTICE and THIRD_PARTY_NOTICES.md
+  reproduce those notices and must be retained with any redistribution.
+- vcruz305's fork (https://github.com/vcruz305/exllamav3) of ExLlamaV3 by
+  turboderp (https://github.com/turboderp-org/exllamav3) at
+  fdd77361971144e8d175e09e7b50b7100739fd95, carrying the act-3 (clamped
+  SwiGLU-OAI) batched-MoE fix. MIT.
+
+Plugin patch series (patches/0001-0019), derivative works of vllm-exl3 and
+therefore AGPL-3.0-only:
+
+- patches/0001-minimax-exl3-lmhead-tp2.patch: derived from tonyd2wild's TP=2
+  LM-head change (MiniMax-M3.1-Flash-EXL3-TP2-2x-DGX-Spark @ 70c4e43).
+- patches/0002-minimax-exl3-indexer-tp2.patch: tonyd2wild's
+  tp2-minimax-indexer.patch from the same repository, byte for byte.
+- patches/0003 to patches/0019: Justin Casey. The weight-snapshot design in
+  0004 follows kindlingai/glm-5.3-flash-gx10's processed-weight snapshots (no
+  code taken). Patches 0007, 0008, 0010, 0015, 0017 and 0019 modify the
+  fat-GEMM kernels that originate with Mia's AI Lab (MIT, see above).
+
+exllamav3 patch series (patches/exllamav3/0001-0003), derivative works of
+exllamav3 and therefore MIT: Justin Casey.
+
+Anyone who distributes a container image built by this recipe must also offer
+the corresponding source under AGPL-3.0-only: this repository (its patches and
+build scripts) plus the vllm-exl3 commit above.
+
+Other credits:
+
+- vcruz305: the EXL3 SAGE 2.15 bpw pack
+  (https://huggingface.co/vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw), the
+  vllm-exl3 plugin, the exllamav3 fork, and the one-Spark recipe whose
+  structure this repository follows.
+- tonyd2wild: the first 2.15 bpw TP=2 lane and the base flag set of the
+  q4-300k profile.
+- vLLM (https://github.com/vllm-project/vllm), Apache-2.0: the base image
+  vllm/vllm-openai:minimax-m31-flash, used unmodified and pinned by digest.
+- MiniMax: MiniMax-M3.1-Flash. The weights, including the EXL3 SAGE pack, are
+  not included in this repository; they are under the MiniMax Community
+  License (non-commercial use, with conditions for commercial use).
+
+The benchmark prompt sets and harness structure follow the author's earlier
+DGX Spark recipes, both Apache-2.0.

@@ -1,0 +1,937 @@
+From 3cecb5ee86fbd696120231f5b701657e7b769180 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:53:25 -0500
+Subject: [PATCH] Decode dense matmul: split-k GEMV with a completion-counter
+ reduction (exl3_dgemv)
+
+exl3_gemm now tries exl3_dgemv first for decode-shaped calls (m <= 16, k and n
+multiples of 128, input/output transforms present). One regular launch, no grid
+barrier: block (128-column group, k split) issues its weight prefetch, rotates
+its k range of the input rows into shared memory (had_hf_r_128_inner, the
+cooperative GEMM's input transform), runs the coop MoE GEMV tile over it with
+fp32-accumulating MMAs (exl3_gemm's accumulation on sm_80+ other than sm_86)
+and writes fp32 partials; the last of a group's arrivals sums them in split
+order and applies the output transform (had_ff/fh_r_128_inner * svh). The
+split-k factor comes from a waves x (k chunks + fixed cost) model over the
+kernel's occupancy at its shared-memory size. Kernel arguments 0..9 are
+exl3_gemm_kernel's, so graph recording is unchanged; the workspace (counters,
+partials) is per device and allocated once.
+
+It replaces the cooperative GEMM's fixed cost (grid barrier plus the serial
+split-k chain through the column locks, ~15-20 us), so it takes the small
+matrices: weight bytes up to 8 MB at m <= 8 and 2 MB at 9..16 rows
+(EXL3_DGEMV_MAX_KB / _KB16; EXL3_DGEMV=0 off, 2 everywhere). gemv_tile gains
+16-row MMAs, an aliased reduction area and fp32 accumulation as template
+options; the MoE coop kernels are unchanged (bit-identical outputs).
+
+GB10, MiniMax-M3.1 TP2-rank decode shapes, cold L2, default dispatch, A/B in
+alternating processes (old -> new):
+  k/v_proj 6144x256 K5:     4 rows 21.4-21.9 -> 10.9-11.6 us, 16 rows 25.6-26.0 -> 14.5 us
+  shared gate/up 6144x1536 K4: 4 rows 30.2-30.3 -> 24.7-25.6 us (was the QTIP GEMV)
+  shared down 1536x6144 K5: 4 rows 34.9-35.4 -> 31.2-31.4 us
+  per verify step at the live call counts: c=1 17.0 -> 14.9 ms, c=4 18.1 -> 16.4 ms
+Accuracy: rel error vs an fp32 reference 2.0-2.2e-4, same as the cooperative
+GEMM (output difference ~5e-7 rel); 2.1e-4 vs 3.9e-4 where the fp16-accumulating
+QTIP GEMV ran. Live-pack weights (layers 1 and 10, both TP2 ranks, rows 1..16)
+pass test_qgemm's assert_close against reconstruct + fp16 matmul; test_moe_coop
+passes.
+---
+ exllamav3/exllamav3_ext/bindings.cpp          |   2 +
+ .../quant/comp_units/exl3_dgemv_inst_k1.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_inst_k2.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_inst_k3.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_inst_k4.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_inst_k5.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_inst_k6.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_inst_k7.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_inst_k8.cu    |   4 +
+ .../quant/comp_units/exl3_dgemv_instances.cuh |  36 +++
+ exllamav3/exllamav3_ext/quant/exl3_dgemv.cu   | 252 ++++++++++++++++++
+ exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh  |  46 ++++
+ .../exllamav3_ext/quant/exl3_dgemv_kernel.cuh | 144 ++++++++++
+ exllamav3/exllamav3_ext/quant/exl3_gemm.cu    |  20 +-
+ .../quant/exl3_moe_coop_kernel.cuh            | 130 +++++++--
+ 15 files changed, 634 insertions(+), 28 deletions(-)
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k1.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k2.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k3.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k4.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k5.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k8.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh
+ create mode 100644 exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh
+ create mode 100644 exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index a7fb4882..d96ba9a9 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -23,6 +23,7 @@
+ #include "quant/hadamard.cuh"
+ #include "quant/exl3_gemm.cuh"
+ #include "quant/exl3_gemv.cuh"
++#include "quant/exl3_dgemv.cuh"
+ #include "quant/exl3_gemv_int8.cuh"
+ #include "cpu/moe_mul1.h"
+ #include "cpu/moe_handoff.h"
+@@ -155,6 +156,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
+     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
++    m.def("exl3_dgemv", &exl3_dgemv, "exl3_dgemv");
+     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
+     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+     m.def("g_get_cc", &g_get_cc, "g_get_cc");
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k1.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k1.cu
+new file mode 100644
+index 00000000..fde30d6d
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k1.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(1)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k2.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k2.cu
+new file mode 100644
+index 00000000..71a92c33
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k2.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(2)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k3.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k3.cu
+new file mode 100644
+index 00000000..eb0a7f88
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k3.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(3)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k4.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k4.cu
+new file mode 100644
+index 00000000..fe2ce38e
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k4.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(4)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k5.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k5.cu
+new file mode 100644
+index 00000000..64cea924
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k5.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(5)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu
+new file mode 100644
+index 00000000..60146a3a
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(6)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu
+new file mode 100644
+index 00000000..e8af979f
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(7)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k8.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k8.cu
+new file mode 100644
+index 00000000..9d9470b3
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k8.cu
+@@ -0,0 +1,4 @@
++#include "exl3_dgemv_instances.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++
++EXL3_DGEMV_INST_DEF(8)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh
+new file mode 100644
+index 00000000..272f66e7
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh
+@@ -0,0 +1,36 @@
++#pragma once
++
++// Per-K compilation units of the decode dense matmul (exl3_dgemv_kernel.cuh): each
++// exl3_dgemv_inst_k{K}.cu instantiates the kernels of width K for the three codebooks, both
++// output dtypes and both MMA row counts (8: m <= 8, 16: m <= 16)
++
++#define EXL3_DGEMV_INST_DECL(K) \
++    void* exl3_dgemv_kernel_k##K(int cb, bool c_fp32, int mr);
++
++EXL3_DGEMV_INST_DECL(1)
++EXL3_DGEMV_INST_DECL(2)
++EXL3_DGEMV_INST_DECL(3)
++EXL3_DGEMV_INST_DECL(4)
++EXL3_DGEMV_INST_DECL(5)
++EXL3_DGEMV_INST_DECL(6)
++EXL3_DGEMV_INST_DECL(7)
++EXL3_DGEMV_INST_DECL(8)
++
++#undef EXL3_DGEMV_INST_DECL
++
++#define EXL3_DGEMV_INST_CB(K, cb_) \
++    if (cb == cb_) \
++    { \
++        if (mr == 8) return c_fp32 ? (void*) exl3_dgemv_kernel<K, cb_, true, 8> : (void*) exl3_dgemv_kernel<K, cb_, false, 8>; \
++        return c_fp32 ? (void*) exl3_dgemv_kernel<K, cb_, true, 16> : (void*) exl3_dgemv_kernel<K, cb_, false, 16>; \
++    }
++
++#define EXL3_DGEMV_INST_DEF(K) \
++    void* exl3_dgemv_kernel_k##K(int cb, bool c_fp32, int mr) \
++    { \
++        using namespace exl3_dgemv_ns; \
++        EXL3_DGEMV_INST_CB(K, 0) \
++        EXL3_DGEMV_INST_CB(K, 1) \
++        EXL3_DGEMV_INST_CB(K, 2) \
++        return nullptr; \
++    }
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+new file mode 100644
+index 00000000..336c1c60
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+@@ -0,0 +1,252 @@
++#include <cuda_fp16.h>
++#include "exl3_dgemv.cuh"
++
++#include <c10/cuda/CUDAGuard.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <map>
++#include "../util.h"
++#include "../util.cuh"
++#include "exl3_devctx.cuh"
++#include "exl3_dgemv_kernel.cuh"
++#include "comp_units/exl3_dgemv_instances.cuh"
++
++using namespace exl3_dgemv_ns;
++
++// EXL3_DGEMV: 0 = off (exl3_gemm keeps its GEMV / cooperative paths), 1/unset = the envelope
++// below, 2 = every eligible call (testing)
++static int dgemv_env_mode()
++{
++    static int mode = -2;
++    if (mode == -2)
++    {
++        const char* env = std::getenv("EXL3_DGEMV");
++        mode = env ? atoi(env) : 1;
++    }
++    return mode;
++}
++
++// Envelope (measured, GB10, MiniMax-M3.1 TP2 decode shapes k 1536..6144, n 256..6144, K 4/5,
++// cold L2): the cooperative GEMM's fixed cost (grid barrier, serial split-k chain through the
++// column locks, ~15-20 us) is what this kernel removes, so it wins on small matrices: up to 8
++// rows, 1 MB 2.1x, 4.7 MB 1.2x, 5.9 MB 1.1x faster, and within +-5% either way from 12 to 24 MB.
++// At 9..16 rows (16-row MMAs, one block per SM) it wins at 1 MB (1.8x) and loses from 4.7 MB up.
++// Weight bytes (k * n * K / 8) up to EXL3_DGEMV_MAX_KB (rows <= 8) / EXL3_DGEMV_MAX_KB16 take it
++static int64_t dgemv_max_bytes(int mr)
++{
++    static int64_t kb8 = -1, kb16 = -1;
++    if (kb8 < 0)
++    {
++        const char* e8 = std::getenv("EXL3_DGEMV_MAX_KB");
++        const char* e16 = std::getenv("EXL3_DGEMV_MAX_KB16");
++        kb8 = e8 ? atoll(e8) : 8192;
++        kb16 = e16 ? atoll(e16) : 2048;
++    }
++    return (mr == 8 ? kb8 : kb16) * 1024;
++}
++
++// Split-k cost model, in 128-wide k chunks: waves x (chunks per block + a fixed cost of
++// EXL3_DGEMV_OVH chunks: start-up, input transform, epilogue) + RED per split (the last
++// arrival's partial sums)
++static int dgemv_env_ovh()
++{
++    static int ovh = -2;
++    if (ovh == -2)
++    {
++        const char* env = std::getenv("EXL3_DGEMV_OVH");
++        ovh = env ? atoi(env) : 4;
++    }
++    return ovh;
++}
++constexpr float DGEMV_RED = 0.1f;
++
++static void* dgemv_select_kernel(int K, int cb, bool c_fp32, int mr)
++{
++    switch (K)
++    {
++        case 1: return exl3_dgemv_kernel_k1(cb, c_fp32, mr);
++        case 2: return exl3_dgemv_kernel_k2(cb, c_fp32, mr);
++        case 3: return exl3_dgemv_kernel_k3(cb, c_fp32, mr);
++        case 4: return exl3_dgemv_kernel_k4(cb, c_fp32, mr);
++        case 5: return exl3_dgemv_kernel_k5(cb, c_fp32, mr);
++        case 6: return exl3_dgemv_kernel_k6(cb, c_fp32, mr);
++        case 7: return exl3_dgemv_kernel_k7(cb, c_fp32, mr);
++        case 8: return exl3_dgemv_kernel_k8(cb, c_fp32, mr);
++        default: return nullptr;
++    }
++}
++
++// Per-device workspace: DG_MAX_GROUPS completion counters (self-resetting, zero at allocation),
++// then the split-k partials. Allocated once and never reallocated: the pointer is baked into
++// captured CUDA graphs. Calls whose partials don't fit take a smaller split
++constexpr size_t DGEMV_WS_BYTES = 16 * 1024 * 1024;
++constexpr size_t DGEMV_PART_BYTES = DGEMV_WS_BYTES - DG_MAX_GROUPS * sizeof(int);
++
++static float* dgemv_get_ws(int device)
++{
++    static float* ws[MAX_DEVICES] = {};
++    if (!ws[device])
++    {
++        cuda_check(cudaMalloc(&ws[device], DGEMV_WS_BYTES));
++        cuda_check(cudaMemset(ws[device], 0, DGEMV_WS_BYTES));
++    }
++    return ws[device];
++}
++
++// Opt-in shared memory size per kernel (set once) and occupancy per (kernel, smem)
++static int dgemv_occupancy(void* kernel, int smem, int device)
++{
++    static std::map<void*, int> optin[MAX_DEVICES];
++    static std::map<std::pair<void*, int>, int> occ[MAX_DEVICES];
++    auto it = optin[device].find(kernel);
++    if (it == optin[device].end())
++    {
++        int max_optin = 0;
++        cuda_check(cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
++        cudaFuncAttributes attr;
++        cuda_check(cudaFuncGetAttributes(&attr, kernel));
++        max_optin -= (int) attr.sharedSizeBytes;
++        cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_optin));
++        it = optin[device].emplace(kernel, max_optin).first;
++    }
++    if (smem > it->second) return 0;
++    auto key = std::make_pair(kernel, smem);
++    auto o = occ[device].find(key);
++    if (o != occ[device].end()) return o->second;
++    int blocks = 0;
++    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, THREADS, smem));
++    occ[device][key] = blocks;
++    return blocks;
++}
++
++bool exl3_dgemv_try_launch
++(
++    void** gemm_args,
++    int size_m,
++    int size_k,
++    int size_n,
++    int K,
++    int cb,
++    bool c_fp32,
++    bool has_su_sv,
++    int device,
++    cudaStream_t stream,
++    void** launched_kernel,
++    int force_ksplit,
++    int* chosen_ksplit
++)
++{
++    if (!has_su_sv) return false;
++    if (size_m < 1 || size_m > DG_MAX_ROWS) return false;
++    if (size_k % 128 || size_n % DG_COLS) return false;
++    if (size_n / DG_COLS > DG_MAX_GROUPS) return false;
++    if (K < 1 || K > 8) return false;
++    const int mr = size_m <= 8 ? 8 : 16;
++    if (force_ksplit == 0)
++    {
++        const int mode = dgemv_env_mode();
++        if (mode == 0) return false;
++        if (mode == 1 && (int64_t) size_k * size_n * K / 8 > dgemv_max_bytes(mr)) return false;
++    }
++
++    void* kernel = dgemv_select_kernel(K, cb, c_fp32, mr);
++    if (!kernel) return false;
++
++    const int ng = size_n / DG_COLS;
++    const int chunks = size_k / 128;
++    const bool stage = !(K == 2 || K == 4);
++    const int num_sms = DevCtx::instance().get_num_sms(device);
++    const size_t part_row_bytes = (size_t) size_m * size_n * sizeof(float);
++
++    // Split-k factor: lowest modeled cost (see dgemv_env_ovh); smallest on ties
++    int ksplit = 0, smem = 0;
++    float best = 1e30f;
++    const int s_max = MIN(chunks, 64);
++    for (int s = force_ksplit > 0 ? MIN(force_ksplit, chunks) : 1; s <= s_max; ++s)
++    {
++        if ((size_t) s * part_row_bytes > DGEMV_PART_BYTES) break;
++        const int kr = CEIL_DIVIDE(chunks, s) * 128;
++        const int sm = dg_main_bytes(mr, size_m, kr) + dg_stage_bytes(stage);
++        const int occ = dgemv_occupancy(kernel, sm, device);
++        if (occ > 0)
++        {
++            const int waves = CEIL_DIVIDE(ng * s, occ * num_sms);
++            const float est = (float) waves * (float) (kr / 128 + dgemv_env_ovh()) + DGEMV_RED * s;
++            if (est < best)
++            {
++                best = est;
++                ksplit = s;
++                smem = sm;
++            }
++        }
++        if (force_ksplit > 0) break;
++    }
++    if (ksplit == 0) return false;
++
++    float* ws = dgemv_get_ws(device);
++    void* args[12];
++    for (int i = 0; i < 10; ++i) args[i] = gemm_args[i];
++    args[10] = (void*) &ksplit;
++    args[11] = (void*) &ws;
++    cuda_check(cudaLaunchKernel(kernel, dim3(ng * ksplit), dim3(THREADS), args, smem, stream));
++
++    if (launched_kernel) *launched_kernel = kernel;
++    if (chosen_ksplit) *chosen_ksplit = ksplit;
++    return true;
++}
++
++int exl3_dgemv
++(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    const c10::optional<at::Tensor>& suh,
++    const c10::optional<at::Tensor>& A_had,
++    const c10::optional<at::Tensor>& svh,
++    bool mcg,
++    bool mul1,
++    int force_ksplit
++)
++{
++    const at::cuda::OptionalCUDAGuard device_guard(A.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++
++    TORCH_CHECK_DIM(B, 3);
++    TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
++    TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
++    TORCH_CHECK_DTYPE(A, kHalf);
++    TORCH_CHECK_DTYPE(B, kShort);
++    TORCH_CHECK(A.is_contiguous() && C.is_contiguous(), "exl3_dgemv: A and C must be contiguous");
++    bool c_fp32 = C.dtype() == at::kFloat;
++    if (!c_fp32) TORCH_CHECK_DTYPE(C, kHalf);
++    TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
++
++    const half* suh_ptr = (const half*) OPTPTR(suh);
++    half* A_had_ptr = (half*) OPTPTR(A_had);
++    const half* svh_ptr = (const half*) OPTPTR(svh);
++
++    int size_m = 1;
++    for (int d = 0; d < A.dim() - 1; ++d) size_m *= A.size(d);
++    int size_k = A.size(-1);
++    int size_n = B.size(1) * 16;
++    int K = B.size(2) / 16;
++    int cb = mcg ? 1 : (mul1 ? 2 : 0);
++
++    int device = A.device().index();
++    int* locks = DevCtx::instance().get_locks(device);
++    const half* A_ptr = (const half*) A.data_ptr();
++    const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
++    void* C_ptr = (void*) C.data_ptr();
++
++    void* kernel_args[] =
++    {
++        (void*)& A_ptr, (void*)& B_ptr, (void*)& C_ptr,
++        (void*)& size_m, (void*)& size_k, (void*)& size_n,
++        (void*)& locks, (void*)& suh_ptr, (void*)& A_had_ptr, (void*)& svh_ptr
++    };
++    int ksplit = 0;
++    bool ok = exl3_dgemv_try_launch(kernel_args, size_m, size_k, size_n, K, cb, c_fp32,
++                                    suh_ptr && svh_ptr, device, stream, nullptr, force_ksplit > 0 ? force_ksplit : -1, &ksplit);
++    TORCH_CHECK(ok, "exl3_dgemv: call is not eligible");
++    cuda_check(cudaPeekAtLastError());
++    return ksplit;
++}
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh
+new file mode 100644
+index 00000000..932788b2
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <ATen/Tensor.h>
++#include <cuda_runtime.h>
++
++// Decode-shaped dense EXL3 matmul (exl3_dgemv_kernel.cuh): m <= 16 rows, k and n multiples of
++// 128, input/output transforms present. Tried first by exl3_gemm for such calls (EXL3_DGEMV=0
++// turns it off). Kernel arguments 0..9 are exl3_gemm_kernel's, so graph recording is the same.
++//
++// Uses a per-device workspace (completion counters and split-k partials): like exl3_gemm's lock
++// buffer, it assumes one such matmul in flight per device at a time.
++
++// Launches and returns true if the call is eligible; *launched_kernel receives the kernel and
++// *chosen_ksplit the split-k factor (both nullable). force_ksplit > 0 fixes the factor, < 0
++// picks it regardless of EXL3_DGEMV (testing), 0 is the dispatch default
++bool exl3_dgemv_try_launch
++(
++    void** gemm_args,
++    int size_m,
++    int size_k,
++    int size_n,
++    int K,
++    int cb,
++    bool c_fp32,
++    bool has_su_sv,
++    int device,
++    cudaStream_t stream,
++    void** launched_kernel,
++    int force_ksplit,
++    int* chosen_ksplit
++);
++
++// Direct entry point (testing; errors if the call is not eligible). Returns the split-k factor
++// (force_ksplit <= 0: the launcher's choice)
++int exl3_dgemv
++(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    const c10::optional<at::Tensor>& suh,
++    const c10::optional<at::Tensor>& A_had,
++    const c10::optional<at::Tensor>& svh,
++    bool mcg,
++    bool mul1,
++    int force_ksplit
++);
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+new file mode 100644
+index 00000000..6715f501
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+@@ -0,0 +1,144 @@
++#pragma once
++
++// Decode-shaped dense EXL3 matmul (m <= 16 rows), regular launch, no grid-wide barrier:
++//
++//   block (group, ks): 128 output columns (group) x one 128-aligned k range (split ks of ksplit).
++//   Issues its weight prefetch, rotates its k range of every input row into shared memory
++//   (had(x * suh), the same op as exl3_gemm's input transform), runs the coop MoE GEMV tile over
++//   it (4 n-warps x 4 k-warps, fp32-accumulating MMAs, as exl3_gemm's on sm_80+ other than sm_86)
++//   and writes its partial sums (fp32) to the workspace. The last of the ksplit arrivals of a group (completion counter,
++//   reset by that block) adds the partials in split order, applies the output transform
++//   (had(.) * svh, exl3_gemm's) and stores C.
++//
++// Replaces the cooperative GEMM's serial split-k chain (blocks of one column pass partial sums
++// down through a lock, one after the other) and its grid barrier, which bound small decode
++// matmuls to ~20 us whatever their size. Arguments 0..9 are exl3_gemm_kernel's, so graph
++// parameter recording is the same.
++
++#include "exl3_moe_coop_kernel.cuh"
++
++namespace exl3_dgemv_ns {
++
++using namespace exl3_moe_coop_ns;
++
++constexpr int DG_COLS = 128;                    // output columns per block (the wide tile)
++constexpr int DG_MAX_ROWS = 16;
++constexpr int DG_MAX_GROUPS = 4096;             // completion counters (size_n <= 512K)
++constexpr float DG_R_SCALE = 0.088388347648f;   // 1/sqrt(128)
++
++static_assert(tile_cols<true>() == DG_COLS, "wide tile width");
++
++// Dynamic shared memory: the rotated input of the k range (rows x k_range halves), which the
++// cross-warp reduction reuses after the slice loop, then the staging area of staged widths
++__host__ __device__ constexpr int dg_red_bytes(int mr) { return tile_wk<true>() * mr * DG_COLS * 4; }
++__host__ __device__ constexpr int dg_stage_bytes(bool stage) { return stage ? WK * STAGE_WORDS * 4 : 0; }
++__host__ __device__ constexpr int dg_main_bytes(int mr, int rows, int k_range)
++{
++    return rows * k_range * 2 > dg_red_bytes(mr) ? rows * k_range * 2 : dg_red_bytes(mr);
++}
++
++// 2 blocks per SM at 8 rows (64 registers, as the coop kernels). The 16-row form spills at 64
++// (5 bpw: 64 B) and measured slower held there, so it keeps one
++template <int bits, int MR>
++constexpr int dg_min_blocks() { return MR == 8 ? 2 : 1; }
++
++template <int bits, int cb, bool c_fp32, int MR>
++__global__ __launch_bounds__(THREADS, dg_min_blocks<bits, MR>())
++void exl3_dgemv_kernel
++(
++    const half* __restrict__ A,
++    const uint16_t* __restrict__ B,
++    void* __restrict__ C,
++    const int size_m,
++    const int size_k,
++    const int size_n,
++    int* __restrict__ locks,            // unused (exl3_gemm_kernel's argument slot)
++    const half* __restrict__ suh,
++    half* __restrict__ A_had,           // unused: the input transform stays in shared memory
++    const half* __restrict__ svh,
++    const int ksplit,
++    float* __restrict__ ws              // [DG_MAX_GROUPS] counters, then [ksplit][size_m][size_n] partials
++)
++{
++    extern __shared__ uint32_t smem_dyn[];
++    __shared__ int sh_rows[DG_MAX_ROWS];
++    __shared__ int sh_flag;
++
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int ng = size_n / DG_COLS;
++    const int group = blockIdx.x % ng;
++    const int ks = blockIdx.x / ng;
++    const int chunks = size_k / 128;
++    const int c_begin = chunks * ks / ksplit;
++    const int c_end = chunks * (ks + 1) / ksplit;
++    const int nch = c_end - c_begin;
++    const int k_range = nch * 128;
++    const int kr_max = CEIL_DIVIDE(chunks, ksplit) * 128;
++
++    half* sh_A = (half*) smem_dyn;
++    float* sh_red = (float*) smem_dyn;
++    uint32_t* sh_stage = smem_dyn + dg_main_bytes(MR, size_m, kr_max) / 4;
++    int* ctr = (int*) ws + group;
++    float* part = ws + DG_MAX_GROUPS;
++
++    if (threadIdx.x < size_m) sh_rows[threadIdx.x] = threadIdx.x;
++
++    // Input transform of this block's k range, overlapping the weight prefetch
++    auto rotate = [&]
++    {
++        for (int it = warp; it < size_m * nch; it += WK)
++        {
++            const int r = it / nch;
++            const int c = c_begin + it % nch;
++            had_hf_r_128_inner<true, false>
++            (
++                A + (size_t) r * size_k + c * 128,
++                sh_A + r * k_range + (c - c_begin) * 128,
++                suh + c * 128,
++                DG_R_SCALE
++            );
++        }
++    };
++
++    // The tile addresses A by absolute k-slice: shift the base so slice c_begin * 8 lands on
++    // the start of the shared copy
++    const half2* A2 = ((const half2*) sh_A) - (size_t) c_begin * 64;
++    gemv_tile<bits, cb, true, decltype(rotate), MR, true, 0>
++    (
++        (const uint32_t*) B, A2, (size_t) k_range / 2, sh_rows, size_m,
++        part + (size_t) ks * size_m * size_n, size_n, true,
++        c_begin * 8, c_end * 8, size_n / 16, group, sh_red, sh_stage, rotate
++    );
++
++    if (ksplit > 1)
++    {
++        if (!arrive_last(ctr, ksplit, &sh_flag)) return;
++        if (threadIdx.x == 0) *ctr = 0;     // every arrival is in: ready for the next launch
++    }
++
++    // Epilogue: one warp per row, the split partials summed in split order, then the output
++    // transform through shared memory (the tile's reduction area is free now)
++    for (int r = warp; r < size_m; r += WK)
++    {
++        const int col = group * DG_COLS + lane * 4;
++        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
++        for (int q = 0; q < ksplit; ++q)
++        {
++            float t0, t1, t2, t3;
++            load_f4_cg(part + ((size_t) q * size_m + r) * size_n + col, t0, t1, t2, t3);
++            v0 += t0; v1 += t1; v2 += t2; v3 += t3;
++        }
++        float* buf = sh_red + warp * DG_COLS;
++        *((float4*) (buf + lane * 4)) = make_float4(v0, v1, v2, v3);
++        __syncwarp();
++        if constexpr (c_fp32)
++            had_ff_r_128_inner<false, true>(buf, ((float*) C) + (size_t) r * size_n + group * DG_COLS,
++                                            svh + group * DG_COLS, DG_R_SCALE);
++        else
++            had_fh_r_128_inner<false, true>(buf, ((half*) C) + (size_t) r * size_n + group * DG_COLS,
++                                            svh + group * DG_COLS, DG_R_SCALE);
++    }
++}
++
++}  // namespace exl3_dgemv_ns
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+index 6675a086..dcbf97f3 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -12,6 +12,7 @@ namespace cg = cooperative_groups;
+ #include "exl3_devctx.cuh"
+ #include "exl3_gemv.cuh"
+ #include "exl3_gemv_int8.cuh"
++#include "exl3_dgemv.cuh"
+ #include "coop_autotune.cuh"
+ #include <set>
+ #include <vector>
+@@ -217,10 +218,25 @@ int exl3_gemm_gr
+         }
+     };
+ 
+-    // QTIP-style GEMV path for small m (exl3_gemv_kernel.cuh). Same kernel arguments, so graph
+-    // recording is identical; falls through to the regular kernel when the heuristic declines
++    // Decode-shaped calls (m <= 16): split-k GEMV with a completion-counter reduction
++    // (exl3_dgemv_kernel.cuh), then the QTIP-style GEMV path for small m (exl3_gemv_kernel.cuh).
++    // Same kernel arguments 0..9, so graph recording is identical; each falls through when its
++    // conditions don't hold
+     if (force_shape_idx <= 0 && force_num_sms <= 0)
+     {
++        void* dgemv_kernel = nullptr;
++        if (exl3_dgemv_try_launch
++        (
++            kernelArgs, size_m, size_k, size_n, K, cb, c_fp32,
++            suh_ptr && svh_ptr,
++            device, stream, &dgemv_kernel, 0, nullptr
++        ))
++        {
++            add_graph_args(dgemv_kernel);
++            cuda_check(cudaPeekAtLastError());
++            return 91;
++        }
++
+         void* gemv_kernel = nullptr;
+         if (exl3_gemv_try_launch
+         (
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+index 18288fc0..7de10508 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+@@ -496,9 +496,31 @@ __device__ __forceinline__ int run_order(int r, int n_runs)
+ // block splitting k across its 16 warps. Body follows exl3_gemv_kernel (MMODE 1, CFG 0) for
+ // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
+ // dq_dispatch. The weight prefetch is issued first; then pre() runs (the caller's remaining
+-// setup), a block barrier publishes rows[] and whatever pre() wrote, and the slice loop starts
++// setup), a block barrier publishes rows[] and whatever pre() wrote, and the slice loop starts.
++// MR: MMA rows in use, 8 (rows 0..7, the MMA's upper half idle) or 16 (nrows up to 16, rows 8..15
++// in the upper half). RED_ALIAS: sh_red overlaps memory the slice loop reads (A in shared
++// memory), so the block synchronizes before the cross-warp reduction writes it. FOLDK: k-slices
++// the fp16-accumulating MMAs run before folding into fp32 (divides PF), or 0: fp32-accumulating
++// MMAs (exl3_gemm's accumulation on sm_80+ other than sm_86)
++
++// mma.m16n8k16 with the A operand supplied as two FragB halves, fp32 accumulate
++__device__ __forceinline__ void mma_ab_f(const FragB& a01, const FragB& a23, const FragB& b, FragC& c)
++{
++    const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
++    const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
++    const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
++    float* cc = reinterpret_cast<float*>(&c);
++    asm
++    (
++        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
++        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++        : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
++        :  "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
++           "r"(bb[0]), "r"(bb[1])
++    );
++}
+ 
+-template <int bits, int cb, bool WIDE, typename Pre>
++template <int bits, int cb, bool WIDE, typename Pre, int MR = ROWS, bool RED_ALIAS = false, int FOLDK = FOLD>
+ __device__ __forceinline__ void gemv_tile
+ (
+     const uint32_t* __restrict__ B32,
+@@ -513,11 +535,15 @@ __device__ __forceinline__ void gemv_tile
+     int k_end,
+     int ntiles,
+     int group,                          // block column group of tile_cols<WIDE>() columns
+-    float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
++    float* __restrict__ sh_red,         // [WKK][MR][TCOLS]
+     uint32_t* __restrict__ sh_stage,    // [WK][STAGE_WORDS], staged widths only
+     Pre pre
+ )
+ {
++    static_assert(MR == 8 || MR == 16, "MMA rows: 8 or 16");
++    static_assert(FOLDK == 0 || PF % FOLDK == 0, "fold cadence must divide the prefetch ring");
++    constexpr bool R16 = MR == 16;
++    constexpr bool F32ACC = FOLDK == 0;
+     constexpr bool REG = tile_reg<bits>();
+     constexpr int TWORDS = 8 * bits;                                            // uint32 per 16x16 tile
+     constexpr int GWORDS = WNT * TWORDS;                                        // uint32 per warp per k-slice
+@@ -540,6 +566,7 @@ __device__ __forceinline__ void gemv_tile
+ 
+     const int r0 = lane >> 2;
+     const bool r0_ok = r0 < nrows;
++    [[maybe_unused]] const bool r1_ok = R16 && r0 + 8 < nrows;
+     const half2 hzero = __half2half2(__ushort_as_half(0));
+ 
+     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+@@ -596,25 +623,39 @@ __device__ __forceinline__ void gemv_tile
+     pre();
+     __syncthreads();
+ 
+-    // A fragment row of this lane: rows[lane / 4] of the run. Lanes past the run's last row read
+-    // that row again, and the MMA's upper 8 rows take whatever the registers hold: rows of an
+-    // m16 MMA are independent and only rows < nrows reach sh_red, so neither affects an output
+-    const size_t a_row0 = (size_t) rows[min(lane >> 2, nrows - 1)] * a_stride2;
++    // A fragment rows of this lane: rows[lane / 4] (and rows[lane / 4 + 8] at MR 16) of the run.
++    // Lanes past the run's last row read that row again, and with MR 8 the MMA's upper 8 rows take
++    // whatever the registers hold: rows of an m16 MMA are independent and only rows < nrows reach
++    // sh_red, so neither affects an output
++    const size_t a_row0 = (size_t) rows[min(r0, nrows - 1)] * a_stride2;
+     const half2* apf_p = A2 + a_row0 + (size_t) ks0 * 8 + (lane & 3);
+-    half2 apf[AD][2];
++    [[maybe_unused]] size_t a_row1_d = 0;
++    if constexpr (R16) a_row1_d = (size_t) rows[min(r0 + 8, nrows - 1)] * a_stride2 - a_row0;
++    half2 apf[AD][R16 ? 4 : 2];
++    auto ld_a = [&] (half2* dst)
++    {
++        dst[0] = apf_p[0];
++        dst[1] = apf_p[4];
++        if constexpr (R16)
++        {
++            dst[2] = apf_p[a_row1_d];
++            dst[3] = apf_p[a_row1_d + 4];
++        }
++    };
+     if (myn > 0)
+     {
+         #pragma unroll
+         for (int d = 0; d < AD; ++d)
+         {
+-            apf[d][0] = apf_p[0];
+-            apf[d][1] = apf_p[4];
++            ld_a(apf[d]);
+             if (d + 1 < AD && d + 1 < myn) apf_p += 8;
+         }
+     }
+ 
+-    FragC_h ch[WNT][2] = {};
++    [[maybe_unused]] FragC_h ch[WNT][2] = {};
++    [[maybe_unused]] FragC cf[WNT][2] = {};
+     float2 acc0[WNT][2] = {};
++    [[maybe_unused]] float2 acc1[WNT][2] = {};
+ 
+     for (int ib = 0; ib < myn; ib += PF)
+     {
+@@ -647,11 +688,18 @@ __device__ __forceinline__ void gemv_tile
+             FragB a01, a23;
+             a01[0] = apf[d % AD][0];
+             a23[0] = apf[d % AD][1];
+-            a01[1] = undef_h2();
+-            a23[1] = undef_h2();
++            if constexpr (R16)
++            {
++                a01[1] = apf[d % AD][2];
++                a23[1] = apf[d % AD][3];
++            }
++            else
++            {
++                a01[1] = undef_h2();
++                a23[1] = undef_h2();
++            }
+             if (i + AD < myn) apf_p += 8;
+-            apf[d % AD][0] = apf_p[0];
+-            apf[d % AD][1] = apf_p[4];
++            ld_a(apf[d % AD]);
+ 
+             #pragma unroll
+             for (int t = 0; t < WNT; ++t)
+@@ -681,11 +729,19 @@ __device__ __forceinline__ void gemv_tile
+                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+                 }
+ 
+-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
++                if constexpr (F32ACC)
++                {
++                    mma_ab_f(a01, a23, f0, cf[t][0]);
++                    mma_ab_f(a01, a23, f1, cf[t][1]);
++                }
++                else
++                {
++                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
++                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
++                }
+             }
+ 
+-            if ((d + 1) % FOLD == 0 || i + 1 == myn)
++            if constexpr (!F32ACC) if ((d + 1) % FOLDK == 0 || i + 1 == myn)
+             {
+                 #pragma unroll
+                 for (int t = 0; t < WNT; ++t)
+@@ -695,37 +751,59 @@ __device__ __forceinline__ void gemv_tile
+                         acc0[t][f].x += __low2float(ch[t][f][0]);
+                         acc0[t][f].y += __high2float(ch[t][f][0]);
+                         ch[t][f][0] = hzero;
++                        if constexpr (R16)
++                        {
++                            acc1[t][f].x += __low2float(ch[t][f][1]);
++                            acc1[t][f].y += __high2float(ch[t][f][1]);
++                            ch[t][f][1] = hzero;
++                        }
+                     }
+             }
+         }
+     }
+ 
+-    // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
++    if constexpr (F32ACC)
++    {
++        #pragma unroll
++        for (int t = 0; t < WNT; ++t)
++            #pragma unroll
++            for (int f = 0; f < 2; ++f)
++            {
++                acc0[t][f] = make_float2(cf[t][f][0], cf[t][f][1]);
++                acc1[t][f] = make_float2(cf[t][f][2], cf[t][f][3]);
++            }
++    }
++
++    if constexpr (RED_ALIAS) __syncthreads();
++
++    // Cross-warp reduction over the k splits. Lane l holds row l/4 (and l/4 + 8), cols
+     // tile*16 + frag*8 + 2*(l%4) (+1)
+-    if (r0_ok)
++    auto red_store = [&] (int r, const float2 (&acc)[WNT][2])
+     {
+         const int c0 = 2 * (lane & 3);
+-        float* red = sh_red + (wk * ROWS + r0) * TCOLS + wn * COLS;
++        float* red = sh_red + (wk * MR + r) * TCOLS + wn * COLS;
+         #pragma unroll
+         for (int t = 0; t < WNT; ++t)
+             #pragma unroll
+             for (int f = 0; f < 2; ++f)
+             {
+                 const int col = t * 16 + f * 8 + c0;
+-                red[col + 0] = acc0[t][f].x;
+-                red[col + 1] = acc0[t][f].y;
++                red[col + 0] = acc[t][f].x;
++                red[col + 1] = acc[t][f].y;
+             }
+-    }
++    };
++    if (r0_ok) red_store(r0, acc0);
++    if constexpr (R16) if (r1_ok) red_store(r0 + 8, acc1);
+     __syncthreads();
+ 
+-    for (int o = threadIdx.x; o < TCOLS * nrows; o += THREADS)     // up to 128 x 8 outputs per block
++    for (int o = threadIdx.x; o < TCOLS * nrows; o += THREADS)     // up to 128 x MR outputs per block
+     {
+         const int r = o / TCOLS;
+         const int c = o % TCOLS;
+         float sum = 0.0f;
+         #pragma unroll
+         for (int j = 0; j < WKK; ++j)
+-            sum += sh_red[(j * ROWS + r) * TCOLS + c];
++            sum += sh_red[(j * MR + r) * TCOLS + c];
+         const size_t idx = (size_t) rows[r] * c_stride + group * TCOLS + c;
+         if (c_f32) ((float*) C)[idx] = sum;
+         else       ((half*) C)[idx] = __float2half_rn(sum);
+-- 
+2.51.0
+

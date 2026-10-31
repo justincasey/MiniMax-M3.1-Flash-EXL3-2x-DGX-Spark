@@ -1,0 +1,416 @@
+From 5ec165cdf9a733ae5d4e3492843f9f2ec101413e Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:07:06 -0500
+Subject: [PATCH] bf16 dense prefill: one bf16 GEMM per EXL3 shard run straight
+ into the layer's bf16 output (default; VLLM_EXL3_BF16_PREFILL=0 restores
+ fp16)
+
+---
+ src/vllm_exl3/exl3.py            | 148 +++++++++++++++++++++----------
+ src/vllm_exl3/weight_snapshot.py |   2 +-
+ tests/gpu/bench_bf16_dense.py    |  97 ++++++++++++++++++++
+ tests/gpu/test_wide_prefill.py   |  85 ++++++++++++++++++
+ 4 files changed, 283 insertions(+), 49 deletions(-)
+ create mode 100644 tests/gpu/bench_bf16_dense.py
+ create mode 100644 tests/gpu/test_wide_prefill.py
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index a503d15..e4a48d1 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -6087,8 +6087,13 @@ def _env_int(name: str, default: int) -> int:
+ 
+ _EXL3_RECON_MIN_ROWS = _env_int("VLLM_EXL3_RECONSTRUCT_MIN_ROWS", 17)
+ _EXL3_COOP_GEMM = os.environ.get("VLLM_EXL3_COOP_GEMM", "").strip() in ("1", "true", "yes")
+-# FP8 (e4m3) dense prefill: layers with rows >= VLLM_EXL3_FP8_PREFILL_MIN_ROWS run the
+-# rotated-basis FP8 path (Exl3LinearMethod._apply_fp8_layer). Off unless VLLM_EXL3_FP8_PREFILL=1.
++# Wide (prefill) dense paths, Exl3LinearMethod._apply_wide_prefill:
++# - bf16 single GEMM per shard run for bf16 activations with rows >= VLLM_EXL3_BF16_PREFILL_MIN_ROWS
++#   (default on; VLLM_EXL3_BF16_PREFILL=0 restores the fp16 reconstruct + hgemm path);
++# - FP8 (e4m3) rotated-basis path for rows >= VLLM_EXL3_FP8_PREFILL_MIN_ROWS, opt-in with
++#   VLLM_EXL3_FP8_PREFILL=1 (takes precedence over bf16).
++_EXL3_BF16_PREFILL = os.environ.get("VLLM_EXL3_BF16_PREFILL", "1").strip() in ("1", "true", "yes")
++_EXL3_BF16_MIN_ROWS = _env_int("VLLM_EXL3_BF16_PREFILL_MIN_ROWS", 1024)
+ _EXL3_FP8_PREFILL = os.environ.get("VLLM_EXL3_FP8_PREFILL", "").strip() in ("1", "true", "yes")
+ _EXL3_FP8_MIN_ROWS = _env_int("VLLM_EXL3_FP8_PREFILL_MIN_ROWS", 1024)
+ _EXL3_FP8_MAX_N = 16384
+@@ -7023,68 +7028,115 @@ class Exl3LinearMethod(LinearMethodBase):
+             y = _lm_head_rank_slice(layer, y)
+         return y
+ 
+-    def _apply_fp8_layer(self, layer, linears, x_2d: torch.Tensor) -> torch.Tensor | None:
+-        """FP8 prefill of a whole fused layer, or None to use the fp16 path.
+-
+-        Every EXL3 shard runs _dense_forward_fp8 on the bf16/fp16 input directly and
+-        writes its output into its column slice of one output in the input dtype, so
+-        the fp16 input copy, per-shard fp32 outputs, the cat and the final cast are
+-        gone. Indexer (MXFP8) and BF16 shards run as before and are copied into
+-        their slices.
++    def _wide_prefill_plan(self, layer, linears):
++        """Column layout and EXL3 shard runs of a fused layer, or None if it cannot take
++        the wide prefill paths (cached per layer)."""
++        plan = layer.__dict__.get("_exl3_wide_plan", False)
++        if plan is not False:
++            return plan
++        plan = None
++        sizes = [int(s) for s in layer._exl3_linear_output_partition_sizes]
++        bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
++        indexer_ids = getattr(layer, "_exl3_indexer_shards", ())
++        mxfp8 = getattr(layer, "_exl3_indexer_mxfp8", None)
++        ok = (
++            not getattr(layer, "_exl3_linear_padded", False)
++            and not getattr(layer, "_exl3_lm_full", False)
++            and len(sizes) == len(linears)
++        )
++        offsets, offset, runs, run = [], 0, [], None
++        for i, linear in enumerate(linears):
++            offsets.append(offset)
++            exl3_shard = not (mxfp8 is not None and i in indexer_ids) and i not in bf16_shards
++            if exl3_shard:
++                if linear is None or not _fp8_eligible(linear) or int(linear.out_features) != sizes[i] or offset % 8:
++                    ok = False
++                if run is None:
++                    run = [i, i + 1]
++                    runs.append(run)
++                else:
++                    run[1] = i + 1
++            else:
++                run = None
++            offset += sizes[i]
++        if ok and runs and all(sum(sizes[a:b]) <= _EXL3_FP8_MAX_N for a, b in runs):
++            plan = (offsets, offset, [tuple(r) for r in runs])
++        layer._exl3_wide_plan = plan
++        return plan
++
++    def _apply_wide_prefill(self, layer, linears, x_2d: torch.Tensor) -> torch.Tensor | None:
++        """Large-batch (prefill) forward of a whole fused layer, or None for the fp16 path.
++
++        The output is one tensor in the input dtype; every shard writes its own column
++        slice, so the fp16 input copy, per-shard fp32 outputs, the cat and the final cast
++        are gone.
++        - bf16 (default, VLLM_EXL3_BF16_PREFILL=1, bf16 activations, rows >=
++          VLLM_EXL3_BF16_PREFILL_MIN_ROWS): each run of consecutive EXL3 shards is
++          reconstructed in the original basis (both Hadamards folded, as LinearEXL3's fused
++          reconstruct does), rounded to bf16 into one [K, run N] weight, and multiplied in
++          one bf16 GEMM (fp32 accumulate) straight into its output columns.
++        - FP8 (opt-in, VLLM_EXL3_FP8_PREFILL=1): _dense_forward_fp8 per EXL3 shard.
++        Indexer (MXFP8) and BF16 shards run as before and are copied into their slices.
+         """
+         rows = int(x_2d.shape[0])
+-        if not (_EXL3_FP8_PREFILL and rows >= _EXL3_FP8_MIN_ROWS and x_2d.dtype in (torch.bfloat16, torch.float16)):
++        fp8 = (
++            _EXL3_FP8_PREFILL
++            and rows >= _EXL3_FP8_MIN_ROWS
++            and x_2d.dtype in (torch.bfloat16, torch.float16)
++            and _fp8_kernels_available()
++            and not (_EXL3_FP8_SKIP is not None and _EXL3_FP8_SKIP.search(str(getattr(layer, "prefix", ""))))
++        )
++        bf16 = (not fp8) and _EXL3_BF16_PREFILL and rows >= _EXL3_BF16_MIN_ROWS and x_2d.dtype == torch.bfloat16
++        if not (fp8 or bf16):
+             return None
+-        plan = layer.__dict__.get("_exl3_fp8_plan", False)
+-        if plan is False:
+-            plan = None
+-            sizes = list(layer._exl3_linear_output_partition_sizes)
+-            bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
+-            indexer_ids = getattr(layer, "_exl3_indexer_shards", ())
+-            mxfp8 = getattr(layer, "_exl3_indexer_mxfp8", None)
+-            ok = (
+-                _fp8_kernels_available()
+-                and not (_EXL3_FP8_SKIP is not None and _EXL3_FP8_SKIP.search(str(getattr(layer, "prefix", ""))))
+-                and not getattr(layer, "_exl3_linear_padded", False)
+-                and len(sizes) == len(linears)
+-            )
+-            offsets, offset = [], 0
+-            for i, linear in enumerate(linears):
+-                offsets.append(offset)
+-                exl3_shard = not (mxfp8 is not None and i in indexer_ids) and i not in bf16_shards
+-                if exl3_shard and (
+-                    linear is None
+-                    or not _fp8_eligible(linear)
+-                    or int(linear.out_features) != int(sizes[i])
+-                    or offset % 8
+-                ):
+-                    ok = False
+-                offset += int(sizes[i])
+-            if ok:
+-                plan = (offsets, offset)
+-            layer._exl3_fp8_plan = plan
+-            logger.info("EXL3 FP8 prefill %s: %s", "ON" if plan else "off", getattr(layer, "prefix", "?"))
++        plan = self._wide_prefill_plan(layer, linears)
+         if plan is None:
+             return None
+-        offsets, total = plan
++        offsets, total, runs = plan
+         x_in = x_2d.contiguous()
+         y = torch.empty((rows, total), dtype=x_2d.dtype, device=x_2d.device)
++        sizes = layer._exl3_linear_output_partition_sizes
++        if fp8:
++            exl3_ids = {i for a, b in runs for i in range(a, b)}
++            for i in exl3_ids:
++                _dense_forward_fp8(linears[i], x_in, out=y[:, offsets[i] : offsets[i] + int(sizes[i])])
++        else:
++            ext = load_exllamav3_ext()
++            k = int(x_in.shape[1])
++            for a, b in runs:
++                run_n = sum(int(sizes[i]) for i in range(a, b))
++                wb = torch.empty((k, run_n), dtype=torch.bfloat16, device=x_in.device)
++                col = 0
++                for i in range(a, b):
++                    lin = linears[i]
++                    n = int(sizes[i])
++                    w16 = torch.empty((k, n), dtype=torch.half, device=x_in.device)
++                    ext.reconstruct_had_slice(w16, lin.trellis, lin.suh, lin.svh, lin.K, lin.mcg, lin.mul1, 0)
++                    wb[:, col : col + n].copy_(w16)
++                    del w16
++                    col += n
++                dst = y[:, offsets[a] : offsets[a] + run_n]
++                torch.mm(x_in, wb, out=dst)
++                del wb
++                for i in range(a, b):
++                    if linears[i].bias is not None:
++                        y[:, offsets[i] : offsets[i] + int(sizes[i])] += linears[i].bias
+         bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
+         bf16_weight = getattr(layer, "_exl3_bf16_weight", None)
+-        sizes = layer._exl3_linear_output_partition_sizes
+         indexer_mxfp8 = getattr(layer, "_exl3_indexer_mxfp8", None)
+         indexer_ids = getattr(layer, "_exl3_indexer_shards", ())
+-        for i, linear in enumerate(linears):
++        for i in range(len(linears)):
+             dst = y[:, offsets[i] : offsets[i] + int(sizes[i])]
+             if indexer_mxfp8 is not None and i in indexer_ids:
+                 kernel, shim = indexer_mxfp8[indexer_ids.index(i)]
+                 dst.copy_(kernel.apply_weights(shim, x_2d))
+             elif i in bf16_shards:
+-                b = bf16_shards.index(i)
+-                start = sum(int(sizes[j]) for j in bf16_shards[:b])
++                j = bf16_shards.index(i)
++                start = sum(int(sizes[s]) for s in bf16_shards[:j])
+                 dst.copy_(F.linear(x_2d, bf16_weight[start : start + int(sizes[i])]))
+-            else:
+-                _dense_forward_fp8(linear, x_in, out=dst)
++        if not layer.__dict__.get("_exl3_wide_logged"):
++            layer._exl3_wide_logged = True
++            logger.info("EXL3 %s prefill: %s", "FP8" if fp8 else "bf16", getattr(layer, "prefix", "?"))
+         return y
+ 
+     def _apply_impl(self, layer, x: torch.Tensor) -> torch.Tensor:
+@@ -7106,7 +7158,7 @@ class Exl3LinearMethod(LinearMethodBase):
+         else:
+             x_2d = x
+ 
+-        y = self._apply_fp8_layer(layer, linears, x_2d)
++        y = self._apply_wide_prefill(layer, linears, x_2d)
+         if y is not None:
+             if len(orig_shape) > 2:
+                 y = y.reshape(*orig_shape[:-1], y.shape[-1])
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index 789b99c..89fe3e7 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -59,7 +59,7 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_MIXEDK_MODE", "VLLM_EXL3_PREFILL_SYNC", "VLLM_EXL3_RECONSTRUCT_MIN_ROWS",
+     "VLLM_EXL3_MOE_LPT", "VLLM_EXL3_COOP", "VLLM_EXL3_COOP_GEMM",
+     "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
+-    "VLLM_EXL3_FP8_PREFILL_SKIP",
++    "VLLM_EXL3_FP8_PREFILL_SKIP", "VLLM_EXL3_BF16_PREFILL", "VLLM_EXL3_BF16_PREFILL_MIN_ROWS",
+ })
+ 
+ try:
+diff --git a/tests/gpu/bench_bf16_dense.py b/tests/gpu/bench_bf16_dense.py
+new file mode 100644
+index 0000000..7435a99
+--- /dev/null
++++ b/tests/gpu/bench_bf16_dense.py
+@@ -0,0 +1,97 @@
++"""Dense EXL3 prefill layer: today's fp16 path vs a bf16 single-GEMM path (run in the image).
++
++today: x bf16 -> fp16 copy; per shard reconstruct_had_slice (fp16, original basis) +
++       hgemm_recon (fp32 out); cat; fp32 -> bf16 cast.
++bf16:  per shard reconstruct_had_slice into fp16 scratch, cast into its column block of one
++       bf16 weight [K, sum N]; one bf16 GEMM x @ W written straight into the bf16 output.
++Shapes are the 2.15 lane's per-rank layers at M = 8192.
++"""
++import time
++
++import torch
++from exllamav3.ext import exllamav3_ext as ext
++
++dev = "cuda"
++torch.manual_seed(0)
++
++
++def shard(k, n, bits=3):
++    tr = torch.randint(-32768, 32767, (k // 16, n // 16, 16 * bits), dtype=torch.int16, device=dev)
++    suh = (torch.where(torch.rand(k, device=dev) < 0.5, -1.0, 1.0) * 0.02).half()
++    svh = (torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0) * 0.02).half()
++    return dict(tr=tr, suh=suh, svh=svh, K=bits, k=k, n=n)
++
++
++def timeit(fn, n=10):
++    fn()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(n):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t) / n * 1e3
++
++
++LAYERS = {
++    "attn qkv (q|k|v)": (6144, [4096, 256, 256]),
++    "attn o_proj": (4096, [6144]),
++    "shared gate_up": (6144, [1536, 1536]),
++    "shared down": (1536, [6144]),
++    "dense gate_up": (6144, [6144, 6144]),
++    "dense down": (6144, [6144]),
++}
++m = 8192
++for name, (k, ns) in LAYERS.items():
++    shards = [shard(k, n) for n in ns]
++    x = (torch.randn(m, k, device=dev) * 2).bfloat16()
++    total = sum(ns)
++    w16 = torch.empty(k, max(ns), dtype=torch.half, device=dev)
++    wb = torch.empty(k, total, dtype=torch.bfloat16, device=dev)
++    yb = torch.empty(m, total, dtype=torch.bfloat16, device=dev)
++
++    def today():
++        xh = x.to(torch.float16)
++        outs = []
++        for s in shards:
++            w = w16[:, : s["n"]] if s["n"] == w16.shape[1] else torch.empty(k, s["n"], dtype=torch.half, device=dev)
++            ext.reconstruct_had_slice(w, s["tr"], s["suh"], s["svh"], s["K"], True, False, 0)
++            y = torch.empty(m, s["n"], dtype=torch.float32, device=dev)
++            ext.hgemm_recon(xh, w, y)
++            outs.append(y)
++        return (torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]).to(torch.bfloat16)
++
++    def bf16():
++        off = 0
++        for s in shards:
++            w = w16[:, : s["n"]] if s["n"] == w16.shape[1] else torch.empty(k, s["n"], dtype=torch.half, device=dev)
++            ext.reconstruct_had_slice(w, s["tr"], s["suh"], s["svh"], s["K"], True, False, 0)
++            wb[:, off : off + s["n"]].copy_(w)
++            off += s["n"]
++        torch.mm(x, wb, out=yb)
++        return yb
++
++    w16m = torch.empty(k, total, dtype=torch.half, device=dev)
++    y32 = torch.empty(m, total, dtype=torch.float32, device=dev)
++
++    def fp16_merged():
++        xh = x.to(torch.float16)
++        off = 0
++        for s in shards:
++            if len(shards) == 1:
++                ext.reconstruct_had_slice(w16m, s["tr"], s["suh"], s["svh"], s["K"], True, False, 0)
++            else:
++                w = w16[:, : s["n"]] if s["n"] == w16.shape[1] else torch.empty(k, s["n"], dtype=torch.half, device=dev)
++                ext.reconstruct_had_slice(w, s["tr"], s["suh"], s["svh"], s["K"], True, False, 0)
++                w16m[:, off : off + s["n"]].copy_(w)
++            off += s["n"]
++        ext.hgemm_recon(xh, w16m, y32)
++        return y32.to(torch.bfloat16)
++
++    ref = today().float()
++    rel_m = ((fp16_merged().float() - ref).norm() / ref.norm()).item()
++    t_m = timeit(fp16_merged)
++    got = bf16().float()
++    rel = ((got - ref).norm() / ref.norm()).item()
++    ptr_ok = bf16().data_ptr() == yb.data_ptr()
++    t0, t1 = timeit(today), timeit(bf16)
++    print(f"{name:<18} M={m} {k}->{ns}: today {t0:.2f} ms | bf16 single GEMM {t1:.2f} ms ({t0 / t1:.2f}x) | rel {rel:.1e} | fp16 merged {t_m:.2f} ms ({t0 / t_m:.2f}x, rel {rel_m:.1e})")
+diff --git a/tests/gpu/test_wide_prefill.py b/tests/gpu/test_wide_prefill.py
+new file mode 100644
+index 0000000..b006730
+--- /dev/null
++++ b/tests/gpu/test_wide_prefill.py
+@@ -0,0 +1,85 @@
++"""Exl3LinearMethod._apply_wide_prefill (bf16 mode) vs the fp16 reconstruct path (run in the image).
++
++A fake fused layer [EXL3 q | EXL3 k | EXL3 v | BF16 shard] like the MiniMax qkv+indexer layout:
++- bf16 output equals the fp16 path (reconstruct_had_slice + hgemm fp32, cast) to bf16 weight
++  rounding (rel < 5e-3), and the BF16 shard's columns equal F.linear exactly;
++- rows below VLLM_EXL3_BF16_PREFILL_MIN_ROWS return None (fp16 path keeps them);
++- timing vs the fp16 path including its casts and cat.
++"""
++import sys
++import time
++import types
++
++sys.path.insert(0, "/src/src")
++import torch
++import torch.nn.functional as F
++from exllamav3.ext import exllamav3_ext as ext
++
++from vllm_exl3 import exl3 as X
++
++dev = "cuda"
++torch.manual_seed(0)
++fails = 0
++
++
++def lin(k, n, bits):
++    return types.SimpleNamespace(
++        in_features=k, out_features=n, K=bits, mcg=True, mul1=False, bias=None,
++        trellis=torch.randint(-32768, 32767, (k // 16, n // 16, 16 * bits), dtype=torch.int16, device=dev),
++        suh=(torch.where(torch.rand(k, device=dev) < 0.5, -1.0, 1.0) * 0.02).half(),
++        svh=(torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0) * 0.02).half(),
++    )
++
++
++k, sizes = 6144, [4096, 256, 256, 512]
++linears = [lin(k, 4096, 3), lin(k, 256, 2), lin(k, 256, 4), None]
++bf16_w = (torch.randn(512, k, device=dev) * 0.01).bfloat16()
++layer = types.SimpleNamespace(
++    _exl3_linear_output_partition_sizes=sizes, _exl3_linear_bf16_shards=[3], _exl3_bf16_weight=bf16_w,
++    prefix="test.qkv",
++)
++method = X.Exl3LinearMethod.__new__(X.Exl3LinearMethod)
++
++
++def fp16_path(x):
++    xh = x.to(torch.float16)
++    outs = []
++    for l in linears[:3]:
++        w = torch.empty(k, l.out_features, dtype=torch.half, device=dev)
++        ext.reconstruct_had_slice(w, l.trellis, l.suh, l.svh, l.K, l.mcg, l.mul1, 0)
++        y = torch.empty(x.shape[0], l.out_features, dtype=torch.float32, device=dev)
++        ext.hgemm_recon(xh, w, y)
++        outs.append(y)
++    outs.append(F.linear(x, bf16_w).float())
++    return torch.cat(outs, dim=1).to(torch.bfloat16)
++
++
++x = (torch.randn(4096, k, device=dev) * 2).bfloat16()
++y = method._apply_wide_prefill(layer, linears, x)
++ref = fp16_path(x)
++r_exl3 = ((y[:, :4608].float() - ref[:, :4608].float()).norm() / ref[:, :4608].float().norm()).item()
++r_bf16 = ((y[:, 4608:].float() - ref[:, 4608:].float()).norm() / ref[:, 4608:].float().norm()).item()
++ok = y.dtype == torch.bfloat16 and r_exl3 < 5e-3 and r_bf16 == 0.0
++fails += not ok
++print(f"bf16 wide prefill: EXL3 columns rel {r_exl3:.1e}, BF16-shard columns rel {r_bf16:.1e} {'OK' if ok else 'FAIL'}")
++
++small = method._apply_wide_prefill(layer, linears, x[:512].contiguous())
++ok = small is None
++fails += not ok
++print(f"512 rows (< min rows) -> fp16 path: {small is None} {'OK' if ok else 'FAIL'}")
++
++
++def timeit(fn, n=10):
++    fn()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(n):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t) / n * 1e3
++
++
++x8 = (torch.randn(8192, k, device=dev) * 2).bfloat16()
++t16, tb = timeit(lambda: fp16_path(x8)), timeit(lambda: method._apply_wide_prefill(layer, linears, x8))
++print(f"M=8192 qkv-like layer: fp16 path {t16:.2f} ms | bf16 wide {tb:.2f} ms ({t16 / tb:.2f}x)")
++sys.exit(1 if fails else 0)
+-- 
+2.51.0
+

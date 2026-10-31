@@ -1,0 +1,128 @@
+{
+ "netdevs": [
+  {
+   "carrier": 1,
+   "ipv4": "192.0.2.12",
+   "mtu": 1500,
+   "name": "enP7s7",
+   "operstate": "UP",
+   "prefix": 24,
+   "rdma": []
+  },
+  {
+   "carrier": 1,
+   "ipv4": "10.0.224.1",
+   "mtu": 9000,
+   "name": "enp1s0f0np0",
+   "operstate": "UP",
+   "prefix": 24,
+   "rdma": [
+    "rocep1s0f0"
+   ]
+  },
+  {
+   "carrier": 1,
+   "ipv4": "10.0.226.1",
+   "mtu": 9000,
+   "name": "enp1s0f1np1",
+   "operstate": "UP",
+   "prefix": 24,
+   "rdma": [
+    "rocep1s0f1"
+   ]
+  },
+  {
+   "carrier": 1,
+   "ipv4": "10.0.225.1",
+   "mtu": 9000,
+   "name": "enP2p1s0f0np0",
+   "operstate": "UP",
+   "prefix": 24,
+   "rdma": [
+    "roceP2p1s0f0"
+   ]
+  },
+  {
+   "carrier": 1,
+   "ipv4": "10.0.227.1",
+   "mtu": 9000,
+   "name": "enP2p1s0f1np1",
+   "operstate": "UP",
+   "prefix": 24,
+   "rdma": [
+    "roceP2p1s0f1"
+   ]
+  }
+ ],
+ "node": "spark-worker",
+ "roce": [
+  {
+   "dev": "roceP2p1s0f0",
+   "gids": [
+    {
+     "index": 2,
+     "ipv4": "10.0.225.1",
+     "type": "IB/RoCE v1"
+    },
+    {
+     "index": 3,
+     "ipv4": "10.0.225.1",
+     "type": "RoCE v2"
+    }
+   ],
+   "link_layer": "Ethernet",
+   "state": "4: ACTIVE"
+  },
+  {
+   "dev": "roceP2p1s0f1",
+   "gids": [
+    {
+     "index": 2,
+     "ipv4": "10.0.227.1",
+     "type": "IB/RoCE v1"
+    },
+    {
+     "index": 3,
+     "ipv4": "10.0.227.1",
+     "type": "RoCE v2"
+    }
+   ],
+   "link_layer": "Ethernet",
+   "state": "4: ACTIVE"
+  },
+  {
+   "dev": "rocep1s0f0",
+   "gids": [
+    {
+     "index": 2,
+     "ipv4": "10.0.224.1",
+     "type": "IB/RoCE v1"
+    },
+    {
+     "index": 3,
+     "ipv4": "10.0.224.1",
+     "type": "RoCE v2"
+    }
+   ],
+   "link_layer": "Ethernet",
+   "state": "4: ACTIVE"
+  },
+  {
+   "dev": "rocep1s0f1",
+   "gids": [
+    {
+     "index": 2,
+     "ipv4": "10.0.226.1",
+     "type": "IB/RoCE v1"
+    },
+    {
+     "index": 3,
+     "ipv4": "10.0.226.1",
+     "type": "RoCE v2"
+    }
+   ],
+   "link_layer": "Ethernet",
+   "state": "4: ACTIVE"
+  }
+ ]
+}

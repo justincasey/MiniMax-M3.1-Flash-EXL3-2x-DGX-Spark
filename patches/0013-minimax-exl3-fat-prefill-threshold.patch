@@ -1,0 +1,155 @@
+From cbfe981e76015a3de3ea2d1fa77c81503dc4d6f4 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 04:45:50 -0500
+Subject: [PATCH] Fat-tier prefill threshold; tiled attention without shape
+ specialization
+
+- VLLM_EXL3_FAT_THRESHOLD_PREFILL / VLLM_EXL3_FAT_PREFILL_TOKENS: batches of at least
+  FAT_PREFILL_TOKENS tokens (default 1024, prefill chunks) take the fat tier above their own
+  row threshold (default: FAT_THRESHOLD). Short batches keep FAT_THRESHOLD, which also caps
+  coop decode eligibility, so their numerics and kernel choice are unchanged. A single low
+  threshold (64) moved the NLL-check code passage and, by shutting 65-128-token mixed
+  batches out of the coop path, cost ~10% of c=4 decode.
+- sparse_attn_tiled: do_not_specialize on n_tiles and the block-table stride; both change
+  every call, and divisibility specialization compiled a new variant per shape class.
+---
+ csrc/exl3_fat_gemm.cu              | 21 ++++++++++++++-------
+ src/vllm_exl3/exl3.py              | 18 +++++++++++++-----
+ src/vllm_exl3/sparse_attn_tiled.py |  4 +++-
+ src/vllm_exl3/weight_snapshot.py   |  2 +-
+ 4 files changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/csrc/exl3_fat_gemm.cu b/csrc/exl3_fat_gemm.cu
+index f441ff5..19531d6 100644
+--- a/csrc/exl3_fat_gemm.cu
++++ b/csrc/exl3_fat_gemm.cu
+@@ -279,14 +279,21 @@ void exl3_fat_gemm_grouped_kernel(
+         __syncthreads();
+         if (stage + 1 < stages) load_stage(stage + 1);
+ 
++        // B fragments are dequantized one sub-block ahead, so the next sub-block's shared
++        // loads and ALU work overlap this sub-block's MMAs.
++        FragB frag_b0[2];
++        FragB frag_b1[2];
++        dq_dispatch<K, CB>(reinterpret_cast<const uint32_t*>(sh_b + warp * FAT_PACKED_WORDS), lane << 3,
++                           frag_b0[0], frag_b1[0]);
+         #pragma unroll
+         for (int sub = 0; sub < FAT_K_SUB; ++sub)
+         {
+-            FragB frag_b0;
+-            FragB frag_b1;
+-            const uint32_t* warp_b = reinterpret_cast<const uint32_t*>(
+-                sh_b + sub * FAT_N_BLOCKS * FAT_PACKED_WORDS + warp * FAT_PACKED_WORDS);
+-            dq_dispatch<K, CB>(warp_b, lane << 3, frag_b0, frag_b1);
++            if (sub + 1 < FAT_K_SUB)
++                dq_dispatch<K, CB>(reinterpret_cast<const uint32_t*>(
++                                       sh_b + (sub + 1) * FAT_N_BLOCKS * FAT_PACKED_WORDS + warp * FAT_PACKED_WORDS),
++                                   lane << 3, frag_b0[(sub + 1) & 1], frag_b1[(sub + 1) & 1]);
++            const FragB& cur_b0 = frag_b0[sub & 1];
++            const FragB& cur_b1 = frag_b1[sub & 1];
+             const int4* sub_a = reinterpret_cast<const int4*>(sh_a + sub * FAT_TILE_M * FAT_TILE_K);
+ 
+             #pragma unroll
+@@ -297,8 +304,8 @@ void exl3_fat_gemm_grouped_kernel(
+                 int base_col = lane / 16;
+                 int swizzled_col = base_col ^ ((row >> 2) & 1);
+                 ldsm4(frag_a, const_cast<int4*>(sub_a) + row * 2 + swizzled_col);
+-                ptx_mma_m16n8k16(frag_a, frag_b0, frag_c[mb][0]);
+-                ptx_mma_m16n8k16(frag_a, frag_b1, frag_c[mb][1]);
++                ptx_mma_m16n8k16(frag_a, cur_b0, frag_c[mb][0]);
++                ptx_mma_m16n8k16(frag_a, cur_b1, frag_c[mb][1]);
+             }
+         }
+         __syncthreads();
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index e2fe41c..7917f6f 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -152,8 +152,15 @@ _COOP_PTR_NAMES = (
+ _COOP_ROWS_MAX = 32
+ try:
+     FAT_EXPERT_THRESHOLD = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD", "256")))
++    # Batches of at least FAT_PREFILL_TOKENS tokens (prefill chunks) use their own row
++    # threshold, so prefill can take the fat tier lower without changing the numerics or the
++    # kernel choice (coop decode is eligible up to FAT_EXPERT_THRESHOLD tokens) of short batches.
++    FAT_THRESHOLD_PREFILL = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD_PREFILL", str(FAT_EXPERT_THRESHOLD))))
++    FAT_PREFILL_TOKENS = max(1, int(os.environ.get("VLLM_EXL3_FAT_PREFILL_TOKENS", "1024")))
+ except (TypeError, ValueError):
+     FAT_EXPERT_THRESHOLD = 256
++    FAT_THRESHOLD_PREFILL = 256
++    FAT_PREFILL_TOKENS = 1024
+ MOE_ACT_SILU = 0
+ # Non-gated relu2 (NemotronH): the gate GEMM is skipped by the kernel; the gate
+ # lane is set to relu(u) so the gate multiply yields relu(u) * u = relu^2(u)
+@@ -3673,10 +3680,11 @@ def apply_exl3_fused_moe(
+             )
+         return out
+ 
+-    fat_possible = (not _capturing) and (tokens > FAT_EXPERT_THRESHOLD)
++    fat_thr = FAT_THRESHOLD_PREFILL if tokens >= FAT_PREFILL_TOKENS else FAT_EXPERT_THRESHOLD
++    fat_possible = (not _capturing) and (tokens > fat_thr)
+     fat_route = torch.zeros_like(local, dtype=torch.bool)
+     if fat_possible:
+-        fat = counts > FAT_EXPERT_THRESHOLD
++        fat = counts > fat_thr
+         if bool(fat.any().item()):
+             safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
+             fat_route = (local < n_exp) & fat.index_select(0, safe_local)
+@@ -3863,7 +3871,7 @@ def apply_exl3_fused_moe(
+                     counts.tolist(),
+                     inners,
+                     limit,
+-                    FAT_EXPERT_THRESHOLD,
++                    fat_thr,
+                     out,
+                     use_kernel=_fat_kernel_available(),
+                     moe_act=moe_act,
+@@ -3975,7 +3983,7 @@ def apply_exl3_fused_moe(
+                 counts.tolist(),
+                 _fat_grouped_tables(layer, inners),
+                 limit,
+-                FAT_EXPERT_THRESHOLD,
++                fat_thr,
+                 out,
+                 moe_act,
+             )
+@@ -3987,7 +3995,7 @@ def apply_exl3_fused_moe(
+                 counts.tolist(),
+                 inners,
+                 limit,
+-                FAT_EXPERT_THRESHOLD,
++                fat_thr,
+                 out,
+                 use_kernel=_fat_kernel_available(),
+                 moe_act=moe_act,
+diff --git a/src/vllm_exl3/sparse_attn_tiled.py b/src/vllm_exl3/sparse_attn_tiled.py
+index 34dffd3..96ff01f 100644
+--- a/src/vllm_exl3/sparse_attn_tiled.py
++++ b/src/vllm_exl3/sparse_attn_tiled.py
+@@ -25,7 +25,9 @@ SPARSE_BLOCK = 128
+ _INT_MAX = 2**31 - 1
+ 
+ 
+-@triton.jit
++# Tile counts and block-table widths change every call; specializing on their divisibility
++# would compile a new variant on a serve's first prompt of each shape class.
++@triton.jit(do_not_specialize=["n_tiles", "stride_bt_b"])
+ def _gqa_sparse_tiled_fwd_kernel(
+     q_ptr,  # [total_q, num_heads, D]
+     kv_ptr,  # [num_blocks, num_kv_heads, 128, 2D]
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index 39f1845..076fe24 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -61,7 +61,7 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_FP8_PREFILL_SKIP", "VLLM_EXL3_BF16_PREFILL", "VLLM_EXL3_BF16_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_MIXEDK_M64_MIN_TOKENS",
+-    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "VLLM_EXL3_SPARSE_TILED", "VLLM_EXL3_SPARSE_TILED_MIN_ROWS",
++    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "VLLM_EXL3_SPARSE_TILED", "VLLM_EXL3_SPARSE_TILED_MIN_ROWS", "VLLM_EXL3_FAT_THRESHOLD_PREFILL", "VLLM_EXL3_FAT_PREFILL_TOKENS",
+ })
+ 
+ try:
+-- 
+2.51.0
+

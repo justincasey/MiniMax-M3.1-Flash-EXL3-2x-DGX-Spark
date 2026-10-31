@@ -1,0 +1,74 @@
+From 7df497b46f80bbc0e1fe82c9024ded881ac7435d Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:01:20 -0500
+Subject: [PATCH] EXL3 fat expert tier: compute the layer's MoE activation
+
+apply_exl3_batched_fat always computed silu(gate) * up. MiniMax-M3 (like
+gpt-oss) uses clamped SwiGLU-OAI, gate * sigmoid(1.702 * gate) * (up + 1),
+which the trellis kernels compute. Any expert whose row count crossed
+VLLM_EXL3_FAT_THRESHOLD therefore ran a different MLP: with prefill chunks
+large enough to reach the tier (VLLM_EXL3_MOE_TEMP_ROWS=8192), 16K needles
+failed 0/3 and a 12K-token teacher-forced NLL rose from 7.26 to 11.15; with
+the threshold at 32 the model emitted garbage. Pass resolve_moe_act()'s index
+in and compute SwiGLU-OAI (or silu / relu2) to match; unknown indices raise.
+After the fix: needles 3/3, long NLL 7.14-7.63 (reference 7.26, run-to-run
+noise ~5%), prefill 587 -> ~880 tok/s at 16K-token chunks.
+---
+ src/vllm_exl3/exl3.py | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index 5e028ac..b26af29 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -3041,8 +3041,16 @@ def apply_exl3_batched_fat(
+     cap: int,
+     out: torch.Tensor,
+     use_kernel: bool = True,
++    moe_act: int = MOE_ACT_SILU,
+ ) -> torch.Tensor:
+-    """Run fat experts with persistent scratch and accelerated 128x128 CUDA GEMM."""
++    """Run fat experts with persistent scratch and accelerated 128x128 CUDA GEMM.
++
++    ``moe_act`` must be the layer's activation index (``resolve_moe_act``): the
++    fused trellis kernels compute it, and the fat tier has to compute the same
++    function or every expert routed here gets a different MLP.
++    """
++    if moe_act not in (MOE_ACT_SILU, MOE_ACT_RELU2_NOGATE, MOE_ACT_SWIGLU_OAI):
++        raise ValueError(f"EXL3 fat expert path has no implementation for activation {moe_act}")
+     native_c = _load_native_exl3_ext()
+     ext = load_exllamav3_ext()
+     offset = 0
+@@ -3173,6 +3181,13 @@ def apply_exl3_batched_fat(
+             torch.nn.functional.relu(up_out, inplace=True)
+             act.copy_(up_out)
+             act.mul_(up_out)
++        elif moe_act == MOE_ACT_SWIGLU_OAI:
++            # Clamped SwiGLU-OAI (gpt-oss / MiniMax-M3), as the trellis kernels
++            # compute it: gate * sigmoid(alpha * gate) * (up + 1), alpha = 1.702
++            # (resolve_moe_gate_params refuses any other alpha/beta).
++            torch.mul(gate_out, MINIMAX_SWIGLU_ALPHA_DEFAULT, out=act)
++            torch.sigmoid(act, out=act)
++            act.mul_(gate_out).mul_(up_out.add_(1.0))
+         else:
+             torch.sigmoid(gate_out, out=act)
+             act.mul_(gate_out).mul_(up_out)
+@@ -3539,6 +3554,7 @@ def apply_exl3_fused_moe(
+                     FAT_EXPERT_THRESHOLD,
+                     out,
+                     use_kernel=_fat_kernel_available(),
++                    moe_act=moe_act,
+                 )
+             return out
+         # Unified mixed-K fused dispatch: per-expert K arrays instead of scalar K.
+@@ -3648,6 +3664,7 @@ def apply_exl3_fused_moe(
+             FAT_EXPERT_THRESHOLD,
+             out,
+             use_kernel=_fat_kernel_available(),
++            moe_act=moe_act,
+         )
+     return out
+ 
+-- 
+2.51.0
+

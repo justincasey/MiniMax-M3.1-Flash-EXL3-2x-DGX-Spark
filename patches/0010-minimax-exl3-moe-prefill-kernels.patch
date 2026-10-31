@@ -1,0 +1,416 @@
+From ab225eac3318fd6115ca24204995125186d9de59 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:54:17 -0500
+Subject: [PATCH] MoE prefill kernels: 64-row mixed-K tile; grouped fat GEMM at
+ two CTAs per SM
+
+- Mixed-K MoE (experts at or below the fat threshold): batches of >= 2048 tokens pass
+  m_tile 64 to exl3_moe_mixedk on mul1 packs, so each dequantized weight tile serves up to
+  64 rows. Per-rank 2.15 shapes: -15% at 2K tokens, -24% at 8K (-11% in the served 15K
+  prefill). Output within 7e-4 of the 16-row tile; both ~6.5e-4 from an fp32 reference.
+  VLLM_EXL3_MIXEDK_M64_MIN_TOKENS (0 disables).
+- Grouped fat GEMM: __launch_bounds__(256, 2) (131 -> 128 registers, no spill) runs two
+  CTAs per SM; the epilogue stores float4 and the scatter uses red.global.add.v4.f32.
+  Serving-like fat loads: gate 3.67 -> 3.25 ms, down scatter 5.68 -> 4.38 ms. Bit-equal
+  to the per-expert kernels (tests/gpu/test_fat_gemm_grouped.py).
+---
+ csrc/exl3_fat_gemm.cu                 |  20 +++--
+ src/vllm_exl3/exl3.py                 |  30 ++++++-
+ src/vllm_exl3/weight_snapshot.py      |   1 +
+ tests/gpu/bench_fat_grouped_shapes.py |  47 +++++++++++
+ tests/gpu/bench_mixedk_decode.py      |  92 +++++++++++++++++++++
+ tests/gpu/bench_mixedk_prefill.py     | 113 ++++++++++++++++++++++++++
+ 6 files changed, 292 insertions(+), 11 deletions(-)
+ create mode 100644 tests/gpu/bench_fat_grouped_shapes.py
+ create mode 100644 tests/gpu/bench_mixedk_decode.py
+ create mode 100644 tests/gpu/bench_mixedk_prefill.py
+
+diff --git a/csrc/exl3_fat_gemm.cu b/csrc/exl3_fat_gemm.cu
+index a007d96..f441ff5 100644
+--- a/csrc/exl3_fat_gemm.cu
++++ b/csrc/exl3_fat_gemm.cu
+@@ -203,7 +203,7 @@ void exl3_fat_gemm_kernel(
+ 
+ // One 16x16 trellis tile packs 256 weights at K bits: 16 * K int16 words.
+ template <int K, int CB, bool scatter>
+-__global__ __launch_bounds__(FAT_THREADS)
++__global__ __launch_bounds__(FAT_THREADS, 2)  // two CTAs per SM: 131 -> <=128 registers
+ void exl3_fat_gemm_grouped_kernel(
+     const half* __restrict__ a,
+     const int64_t* __restrict__ packed_ptrs,
+@@ -340,22 +340,26 @@ void exl3_fat_gemm_grouped_kernel(
+         }
+         __syncthreads();
+ 
+-        for (int i = t; i < rows * FAT_TILE_N; i += FAT_THREADS)
++        // Four consecutive columns per thread: float4 stores, and for the scatter one
++        // vector reduction (red.global.add.v4.f32, sm_90+) instead of four scalar atomics.
++        for (int i = t; i < rows * (FAT_TILE_N / 4); i += FAT_THREADS)
+         {
+-            int row = i / FAT_TILE_N;
+-            int col_out = i % FAT_TILE_N;
++            int row = i / (FAT_TILE_N / 4);
++            int col_out = (i % (FAT_TILE_N / 4)) * 4;
+             int source_row = m_base + mb * 16 + row;
+-            float value = sh_c[i];
++            float4 v = *reinterpret_cast<const float4*>(sh_c + row * FAT_TILE_N + col_out);
+             if constexpr (scatter)
+             {
+                 int64_t destination = token_idx[source_row];
+-                value *= __half2float(route_weight[source_row]);
++                float w = __half2float(route_weight[source_row]);
++                float* dst = out + destination * size_n + n_base + col_out;
+                 // Experts of one launch can share a token: accumulate atomically.
+-                atomicAdd(out + destination * size_n + n_base + col_out, value);
++                asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
++                             :: "l"(dst), "f"(v.x * w), "f"(v.y * w), "f"(v.z * w), "f"(v.w * w) : "memory");
+             }
+             else
+             {
+-                out[source_row * size_n + n_base + col_out] = value;
++                *reinterpret_cast<float4*>(out + static_cast<size_t>(source_row) * size_n + n_base + col_out) = v;
+             }
+         }
+         __syncthreads();
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index e4a48d1..125935c 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -2363,8 +2363,31 @@ def _exl3_moe_temp_rows(temps) -> int:
+     return int(TEMP_ROWS_FUSED)
+ 
+ 
++# Prefill row tile of the mixed-K MoE kernel. exllamav3 instantiates 32/64-row tiles for the
++# mul1 codebook; the 64-row instance shares each dequantized weight tile across up to 64
++# rows (it drops to 32/16-row tiles per expert as rows run out). Measured on the 2.15 pack's
++# per-rank shapes: -15% at 2K tokens, -24% at 8K, slower below ~1.5K tokens; output within
++# 7e-4 of the 16-row tile, both ~6.5e-4 from an fp32 reference. Batches with at least
++# VLLM_EXL3_MIXEDK_M64_MIN_TOKENS tokens (default 2048; 0 disables) take it.
++_MIXEDK_M64_MIN_TOKENS = int(os.environ.get("VLLM_EXL3_MIXEDK_M64_MIN_TOKENS", "2048"))
++
++
++def _mixedk_m_tile(layer: Any, tokens: int, capturing: bool, temp_rows: int) -> int:
++    flags = getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS)
++    mul1 = bool(flags[1])
++    if (
++        _MIXEDK_M64_MIN_TOKENS > 0
++        and not capturing
++        and mul1
++        and tokens >= _MIXEDK_M64_MIN_TOKENS
++        and temp_rows >= 64
++    ):
++        return 64
++    return 16
++
++
+ def _exl3_moe_tail(fn, temp_rows: int, n_exp: int, k_max: int | None = None,
+-                   expert_order=None) -> tuple:
++                   expert_order=None, m_tile: int = 16) -> tuple:
+     """Trailing arguments exllamav3 1.5.0 added to exl3_moe, or () for older bindings.
+ 
+     1.5.0 appended output_scratch and fused_base (fp32 slot scratch plus slot table for
+@@ -2382,9 +2405,9 @@ def _exl3_moe_tail(fn, temp_rows: int, n_exp: int, k_max: int | None = None,
+         # 03, the K-descending expert order) after m_tile. Passed explicitly because
+         # arity alone cannot separate this from the uniform binding's expert_lo/hi.
+         if arity is not None and arity >= EXL3_MOE_ARITY_ORDER:
+-            return (None, None, 1, int(temp_rows), 16, int(k_max), expert_order)
++            return (None, None, 1, int(temp_rows), int(m_tile), int(k_max), expert_order)
+         if arity is not None and arity >= EXL3_MOE_ARITY_KMAX:
+-            return (None, None, 1, int(temp_rows), 16, int(k_max))
++            return (None, None, 1, int(temp_rows), int(m_tile), int(k_max))
+     if arity is not None and arity >= EXL3_MOE_ARITY_151:
+         # expert_lo/expert_hi default to "every expert": the kernel-side filter is
+         # a no-op until a caller narrows it (the packed K-group dispatch does).
+@@ -3799,6 +3822,7 @@ def apply_exl3_fused_moe(
+             n_exp,
+             int(getattr(layer, "_exl3_k_max_launch", 8)),
+             expert_order,
++            _mixedk_m_tile(layer, tokens, _capturing, _exl3_moe_temp_rows(temps)),
+         )
+         n_active_mk = -1 if _exl3_moe_accepts_num_active(fn_mk) else None
+         if tail and n_active_mk is None:
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index 89fe3e7..4cb8180 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -60,6 +60,7 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_MOE_LPT", "VLLM_EXL3_COOP", "VLLM_EXL3_COOP_GEMM",
+     "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_FP8_PREFILL_SKIP", "VLLM_EXL3_BF16_PREFILL", "VLLM_EXL3_BF16_PREFILL_MIN_ROWS",
++    "VLLM_EXL3_MIXEDK_M64_MIN_TOKENS",
+ })
+ 
+ try:
+diff --git a/tests/gpu/bench_fat_grouped_shapes.py b/tests/gpu/bench_fat_grouped_shapes.py
+new file mode 100644
+index 0000000..b463abe
+--- /dev/null
++++ b/tests/gpu/bench_fat_grouped_shapes.py
+@@ -0,0 +1,47 @@
++"""Grouped fat GEMM at serving-like fat-tier loads (run in the image): ~24 experts x 260-700 rows.
++gate (6144->1536 K2, plain store), down (1536->6144 K2, atomic scatter), down plain store."""
++import time
++import torch
++import vllm_exl3_c as nat
++
++dev = "cuda"
++torch.manual_seed(0)
++counts = torch.randint(260, 700, (24,)).tolist()
++rows = sum(counts)
++starts = [0]
++for n in counts:
++    starts.append(starts[-1] + n)
++bounds = torch.tensor([b for g in range(len(counts)) for b in (starts[g], starts[g + 1])], dtype=torch.int32, device=dev)
++el, eh = torch.empty(0, dtype=torch.long, device=dev), torch.empty(0, dtype=torch.float16, device=dev)
++
++
++def setup(k_in, k_out, K):
++    tr = [torch.randint(-32768, 32767, (k_in // 16, k_out // 16, 16 * K), dtype=torch.int16, device=dev) for _ in counts]
++    sv = [(torch.rand(k_out, device=dev) + 0.5).half() for _ in counts]
++    return (torch.tensor([t.data_ptr() for t in tr], dtype=torch.int64, device=dev),
++            torch.tensor([t.data_ptr() for t in sv], dtype=torch.int64, device=dev), tr, sv)
++
++
++def timeit(fn, n=20):
++    fn(); torch.cuda.synchronize(); t = time.perf_counter()
++    for _ in range(n): fn()
++    torch.cuda.synchronize(); return (time.perf_counter() - t) / n * 1e3
++
++
++g_tp, g_sp, *_keep_g = setup(6144, 1536, 2)
++d_tp, d_sp, *_keep_d = setup(1536, 6144, 2)
++a_g = (torch.randn(rows, 6144, device=dev) * 0.5).half()
++a_d = (torch.randn(rows, 1536, device=dev) * 0.5).half()
++o_g = torch.empty(rows, 1536, dtype=torch.float32, device=dev)
++o_dp = torch.empty(rows, 6144, dtype=torch.float32, device=dev)
++o_ds = torch.zeros(8192, 6144, dtype=torch.float32, device=dev)
++tok = torch.cat([torch.randperm(8192, device=dev)[:n] for n in counts]).long()
++wt = torch.rand(rows, device=dev).half()
++fl = 2 * rows * 6144 * 1536
++for name, fn in (
++    ("gate plain", lambda: nat.exl3_fat_gemm_grouped(a_g, g_tp, o_g, g_sp, bounds, el, eh, 2, False, True, False, 1536, max(counts))),
++    ("down scatter", lambda: nat.exl3_fat_gemm_grouped(a_d, d_tp, o_ds, d_sp, bounds, tok, wt, 2, False, True, True, 6144, max(counts))),
++    ("down plain", lambda: nat.exl3_fat_gemm_grouped(a_d, d_tp, o_dp, d_sp, bounds, el, eh, 2, False, True, False, 6144, max(counts))),
++):
++    ms = timeit(fn)
++    print(f"{name:<13} {rows} rows / {len(counts)} experts: {ms:.2f} ms ({fl / ms / 1e9:.1f} TFLOPS)")
+diff --git a/tests/gpu/bench_mixedk_decode.py b/tests/gpu/bench_mixedk_decode.py
+new file mode 100644
+index 0000000..5a17fe0
+--- /dev/null
++++ b/tests/gpu/bench_mixedk_decode.py
+@@ -0,0 +1,92 @@
++"""exl3_moe_mixedk at decode shape on the 2.15 lane's per-rank expert geometry (run in the image).
++
++128 experts, hidden 6144, intermediate 1536 (TP2), gate/up K2, down K2 (112) / K3 (16), mul1
++codebook, SwiGLU-OAI. A verify step is 4 rows x top-4. Reports time per launch, the bytes
++of distinct routed experts and the effective bandwidth, for k_max values (instance choice).
++"""
++import sys
++import time
++
++import torch
++from exllamav3.ext import exllamav3_ext as ext
++
++dev = "cuda"
++torch.manual_seed(0)
++H, I, E, TOPK = 6144, 1536, 128, 4
++MOE_ACT_SWIGLU_OAI = 3
++kg = torch.full((E,), 2, dtype=torch.int32)
++ku = torch.full((E,), 2, dtype=torch.int32)
++kd = torch.full((E,), 2, dtype=torch.int32)
++kd[torch.randperm(E)[:16]] = 3
++
++
++def tensors(k_in, k_out, K):
++    tr = torch.randint(-32768, 32767, (k_in // 16, k_out // 16, 16 * K), dtype=torch.int16, device=dev)
++    suh = (torch.where(torch.rand(k_in, device=dev) < 0.5, -1.0, 1.0)).half()
++    svh = (torch.rand(k_out, device=dev) * 0.02 + 0.01).half()
++    return tr, suh, svh
++
++
++experts = []
++for e in range(E):
++    experts.append({"gate": tensors(H, I, int(kg[e])), "up": tensors(H, I, int(ku[e])), "down": tensors(I, H, int(kd[e]))})
++
++
++def ptr(p, i):
++    return torch.tensor([experts[e][p][i].data_ptr() for e in range(E)], dtype=torch.int64, device=dev)
++
++
++P = [ptr(p, i) for p in ("gate", "up", "down") for i in range(3)]
++conc = int(ext.exl3_moe_max_concurrency(0))
++ROWS = 64
++temps = [torch.empty((conc, ROWS, H), dtype=torch.half, device=dev) for _ in range(2)] + \
++        [torch.empty((conc, ROWS, I), dtype=torch.half, device=dev) for _ in range(2)]
++KG, KU, KD = kg.to(dev), ku.to(dev), kd.to(dev)
++expert_bytes = [sum(experts[e][p][0].numel() * 2 for p in ("gate", "up", "down")) for e in range(E)]
++
++
++def run(x, sel, w, k_max):
++    tokens = x.shape[0]
++    flat = sel.reshape(-1)
++    order = flat.argsort(stable=True)
++    token_sorted = torch.arange(tokens, device=dev).repeat_interleave(TOPK)[order]
++    weight_sorted = w.reshape(-1)[order].half()
++    count = torch.zeros(E + 1, dtype=torch.long, device=dev)
++    count.scatter_add_(0, flat.long(), torch.ones_like(flat, dtype=torch.long))
++    out = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++
++    def go():
++        out.zero_()
++        ext.exl3_moe_mixedk(x, out, count, token_sorted, weight_sorted, *temps, MOE_ACT_SWIGLU_OAI, KG, KU, KD, *P,
++                            False, True, False, True, False, True, 7.0, -1, None, None, 1, ROWS, 16, k_max, None)
++    return go, out
++
++
++for tokens in (1, 4, 8):
++    x = (torch.randn(tokens, H, device=dev) * 0.5).half()
++    sel = torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(tokens)])
++    w = torch.rand(tokens, TOPK, device=dev) * 0.5
++    distinct = torch.unique(sel).tolist()
++    mb = sum(expert_bytes[e] for e in distinct) / 1e6
++    outs = {}
++    for k_max in [int(v) for v in __import__('os').environ.get('KMAX', '3,8').split(',')]:
++        go, out = run(x, sel, w, k_max)
++        go()
++        torch.cuda.synchronize()
++        n = 200
++        t = time.perf_counter()
++        for _ in range(n):
++            go()
++        torch.cuda.synchronize()
++        us = (time.perf_counter() - t) / n * 1e6
++        outs[k_max] = out.clone()
++        print(f"tokens={tokens} distinct experts={len(distinct)} ({mb:.1f} MB): k_max={k_max} {us:7.1f} us "
++              f"-> {mb / us * 1e3:.0f} GB/s")
++    ref_path = f"/tmp/mixedk_ref_t{tokens}.pt"
++    import os
++    if os.environ.get("SAVE_REF"):
++        torch.save(outs[3].cpu(), ref_path)
++    elif os.path.exists(ref_path):
++        ref = torch.load(ref_path).to(dev)
++        print(f"  vs reference run rel {((outs[3] - ref).norm() / ref.norm()).item():.1e}")
++sys.exit(0)
+diff --git a/tests/gpu/bench_mixedk_prefill.py b/tests/gpu/bench_mixedk_prefill.py
+new file mode 100644
+index 0000000..8e88a6f
+--- /dev/null
++++ b/tests/gpu/bench_mixedk_prefill.py
+@@ -0,0 +1,113 @@
++"""exl3_moe_mixedk at prefill shape: m_tile 16 vs 32 vs 64 (run in the image).
++
++2.15-lane per-rank geometry (128 experts, hidden 6144, intermediate 1536, K2 gate/up, K2/K3
++down, mul1, SwiGLU-OAI). 8192 tokens x top-4 with skewed routing; the launch owns experts
++with 1..256 rows (count band), as in serving where experts above 256 rows take the fat tier.
++Prints time and the max relative difference against m_tile 16.
++"""
++import sys
++import time
++
++import torch
++from exllamav3.ext import exllamav3_ext as ext
++
++dev = "cuda"
++torch.manual_seed(0)
++import os
++H, I, E, TOPK = 6144, 1536, 128, 4
++T = int(os.environ.get("T", "8192"))
++kg = torch.full((E,), 2, dtype=torch.int32)
++ku = torch.full((E,), 2, dtype=torch.int32)
++kd = torch.full((E,), 2, dtype=torch.int32)
++kd[torch.randperm(E)[:16]] = 3
++
++
++def tensors(k_in, k_out, K):
++    tr = torch.randint(-32768, 32767, (k_in // 16, k_out // 16, 16 * K), dtype=torch.int16, device=dev)
++    suh = (torch.where(torch.rand(k_in, device=dev) < 0.5, -1.0, 1.0)).half()
++    svh = (torch.rand(k_out, device=dev) * 0.02 + 0.01).half()
++    return tr, suh, svh
++
++
++experts = [{"gate": tensors(H, I, int(kg[e])), "up": tensors(H, I, int(ku[e])), "down": tensors(I, H, int(kd[e]))}
++           for e in range(E)]
++P = [torch.tensor([experts[e][p][i].data_ptr() for e in range(E)], dtype=torch.int64, device=dev)
++     for p in ("gate", "up", "down") for i in range(3)]
++conc = int(ext.exl3_moe_max_concurrency(0))
++ROWS = 1024
++temps = [torch.empty((conc, ROWS, H), dtype=torch.half, device=dev) for _ in range(2)] + \
++        [torch.empty((conc, ROWS, I), dtype=torch.half, device=dev) for _ in range(2)]
++KG, KU, KD = kg.to(dev), ku.to(dev), kd.to(dev)
++
++# Skewed routing: expert popularity ~ lognormal, so row counts spread over ~20..600.
++pop = torch.distributions.LogNormal(0, 0.8).sample((E,))
++sel = torch.multinomial(pop.repeat(T, 1), TOPK, replacement=False).to(dev)
++x = (torch.randn(T, H, device=dev) * 0.5).half()
++w = (torch.rand(T, TOPK, device=dev) * 0.5).half()
++flat = sel.reshape(-1)
++order = flat.argsort(stable=True)
++token_sorted = torch.arange(T, device=dev).repeat_interleave(TOPK)[order]
++weight_sorted = w.reshape(-1)[order]
++count = torch.zeros(E + 1, dtype=torch.long, device=dev)
++count.scatter_add_(0, flat.long(), torch.ones_like(flat, dtype=torch.long))
++c = count[:E].cpu()
++band = (c >= 1) & (c <= 256)
++print(f"experts in band 1..256: {int(band.sum())}, rows {int(c[band].sum())}, mean {float(c[band].float().mean()):.0f}")
++flops = 2 * 3 * H * I * int(c[band].sum())
++
++res = {}
++for mt in (16, 32, 64):
++    out = torch.zeros(T, H, dtype=torch.float32, device=dev)
++
++    def go():
++        out.zero_()
++        ext.exl3_moe_mixedk(x, out, count, token_sorted, weight_sorted, *temps, 3, KG, KU, KD, *P,
++                            False, True, False, True, False, True, 7.0, -1, None, None, 1, 256, mt, 3, None)
++    go()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(10):
++        go()
++    torch.cuda.synchronize()
++    ms = (time.perf_counter() - t) * 100
++    res[mt] = out.clone()
++    extra = ""
++    if mt != 16:
++        extra = f" | rel vs m16 {((res[mt] - res[16]).norm() / res[16].norm()).item():.1e}"
++    print(f"m_tile {mt:2d}: {ms:7.2f} ms ({flops / ms / 1e9:.1f} TFLOPS){extra}")
++
++# fp32 reference over the band experts: fp16 reconstruct (exact trellis values), fp32 GEMMs.
++def had(t, pre=None, post=None):
++    t = t.float().contiguous()
++    ext.had_r_128(t, t, pre, post, 1.0)
++    return t
++
++ref = torch.zeros(T, H, dtype=torch.float32, device=dev)
++starts = torch.cat([torch.zeros(1, dtype=torch.long), count[:E].cpu().cumsum(0)])
++for e in range(E):
++    n = int(c[e])
++    if not (1 <= n <= 256):
++        continue
++    rows = token_sorted[starts[e]:starts[e] + n]
++    wts = weight_sorted[starts[e]:starts[e] + n].float()
++    xe = x.index_select(0, rows)
++    out_e = []
++    for p in ("gate", "up"):
++        tr, suh, svh = experts[e][p]
++        W = torch.empty(H, I, dtype=torch.half, device=dev)
++        ext.reconstruct(W, tr, int(kg[e] if p == "gate" else ku[e]), False, True)
++        xh = had(xe.float() * suh.float())
++        out_e.append(had(xh @ W.float(), None, svh.float().half()))
++    g, u = out_e
++    g = g.clamp(max=7.0)
++    u = u.clamp(min=-7.0, max=7.0)
++    a = g * torch.sigmoid(1.702 * g) * (u + 1.0)
++    tr, suh, svh = experts[e]["down"]
++    W = torch.empty(I, H, dtype=torch.half, device=dev)
++    ext.reconstruct(W, tr, int(kd[e]), False, True)
++    ah = had(a * suh.float())
++    d = had(ah @ W.float(), None, svh.float().half())
++    ref.index_add_(0, rows, d * wts[:, None])
++for mt in (16, 64):
++    print(f"m_tile {mt}: rel vs fp32 reference {((res[mt] - ref).norm() / ref.norm()).item():.2e}")
++sys.exit(0)
+-- 
+2.51.0
+

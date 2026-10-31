@@ -1,0 +1,49 @@
+From 888ebc8e3c62c637bf08dbf9a6f4b2f90aee5aec Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:59:39 -0500
+Subject: [PATCH] EXL3 MoE prescan: no expert offset under TP without EP
+
+vLLM builds an EP group even when expert parallelism is off, so under
+TP=2 rank 1 computed starting_expert_offset = 1 * num_experts and its
+checkpoint prescan looked for expert ids 128..255 of a 128-expert
+model. The prescan returned None and every MoE layer on rank 1 fell
+back to stage-and-pack (21,888 warnings, ~60 s of arena packing).
+Use offset 0 when layer.use_ep is False.
+---
+ src/vllm_exl3/exl3.py | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index a3177c5..5e028ac 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -4570,13 +4570,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         layer._exl3_n_experts = int(num_experts)
+         # Linear EP placement offset for checkpoint prescan (local->global).
+         if not hasattr(layer, "starting_expert_offset"):
+-            try:
+-                from vllm.distributed.parallel_state import get_ep_group
+-
+-                ep = get_ep_group()
+-                layer.starting_expert_offset = int(ep.rank) * int(num_experts)
+-            except Exception:
++            if getattr(layer, "use_ep", None) is False:
++                # TP without expert parallelism: every rank holds every expert.
++                # vLLM still builds an EP group (rank 1 of 2 under TP=2), and an
++                # ep.rank-based offset sends rank 1's prescan to expert ids that
++                # do not exist, so it silently falls back to stage-and-pack.
+                 layer.starting_expert_offset = 0
++            else:
++                try:
++                    from vllm.distributed.parallel_state import get_ep_group
++
++                    ep = get_ep_group()
++                    layer.starting_expert_offset = int(ep.rank) * int(num_experts)
++                except Exception:
++                    layer.starting_expert_offset = 0
+         # Header-only shape scan (no allocation yet). Arenas are created on the
+         # first trellis load after the module has been moved to its exec device,
+         # so a later layer.to(device) cannot clone views apart.
+-- 
+2.51.0
+

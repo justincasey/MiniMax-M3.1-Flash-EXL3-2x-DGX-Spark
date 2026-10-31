@@ -1,0 +1,546 @@
+From 393f78a0bd5878d84f043e9a71c7a8e2dca77c26 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 04:17:58 -0500
+Subject: [PATCH] Q4 prefill: query-tiled MiniMax-M3 sparse attention for
+ prefill-sized calls
+
+vLLM's _gqa_sparse_fwd_kernel runs one program per (query token, kv head) and loads that
+token's 16 selected 128-token KV blocks, so each block is re-read from L2 by every token
+that picked it. Real indexer selections are strongly correlated between neighbours: an
+8-token tile's union averages 18.9 blocks against 128 unshared (captured live topk_idx).
+
+sparse_attn_tiled.py takes 8 consecutive rows of one request per program, iterates the
+sorted union of their selected blocks once, and masks per row (selection, causal, seq
+length) so every row attends exactly its own blocks; only the order in which blocks enter
+the online softmax differs. Against an fp32 reference it matches vLLM's kernel to three
+digits (1.5-2.3e-3, tests/gpu/test_sparse_attn_tiled.py); per call 12.4 -> 5.6 ms.
+
+The q4 prefill wrapper uses it for calls with >= VLLM_EXL3_SPARSE_TILED_MIN_ROWS rows (1024)
+and keeps vLLM's kernel below that (short prompts, the NLL-check passages);
+VLLM_EXL3_SPARSE_TILED=0 disables it. Served prefill 8K/16K 1167/1221 -> 1237/1268 tok/s.
+---
+ src/vllm_exl3/minimax_q4kv.py       |  24 +++-
+ src/vllm_exl3/sparse_attn_tiled.py  | 193 ++++++++++++++++++++++++++++
+ src/vllm_exl3/weight_snapshot.py    |   2 +-
+ tests/gpu/bench_sparse_attn.py      |  97 ++++++++++++++
+ tests/gpu/bench_sparse_attn_real.py |  44 +++++++
+ tests/gpu/test_sparse_attn_tiled.py |  83 ++++++++++++
+ 6 files changed, 440 insertions(+), 3 deletions(-)
+ create mode 100644 src/vllm_exl3/sparse_attn_tiled.py
+ create mode 100644 tests/gpu/bench_sparse_attn.py
+ create mode 100644 tests/gpu/bench_sparse_attn_real.py
+ create mode 100644 tests/gpu/test_sparse_attn_tiled.py
+
+diff --git a/src/vllm_exl3/minimax_q4kv.py b/src/vllm_exl3/minimax_q4kv.py
+index ea35d4c..bcd5c0a 100644
+--- a/src/vllm_exl3/minimax_q4kv.py
++++ b/src/vllm_exl3/minimax_q4kv.py
+@@ -566,6 +566,14 @@ def _prefill_fast_enabled() -> bool:
+     )
+ 
+ 
++# Query-tiled prefill sparse attention (sparse_attn_tiled.py); VLLM_EXL3_SPARSE_TILED=0 keeps
++# vLLM's per-token kernel.
++_SPARSE_TILED = os.environ.get("VLLM_EXL3_SPARSE_TILED", "1") != "0"
++# Calls below this many query rows keep vLLM's kernel (short prompts, where tiling has
++# little to share and the NLL-check passages live).
++_SPARSE_TILED_MIN_ROWS = int(os.environ.get("VLLM_EXL3_SPARSE_TILED_MIN_ROWS", "1024"))
++
++
+ def _make_prefill_wrapper(original):
+     def minimax_m3_sparse_attn(
+         q,
+@@ -661,6 +669,18 @@ def _make_prefill_wrapper(original):
+             and slices[0]["reqs"] == list(range(num_reqs))
+             and slices[0]["q"] == (0, q.shape[0])
+         )
++        from vllm_exl3.sparse_attn_tiled import sparse_attn_tiled
++
++        def attn(q_, kv_, topk_, bt_, cu_, sl_, pl_, maxq_, kvh_, scale_, out_):
++            # Query-tiled kernel for prefill-sized calls: 8 consecutive rows share one pass
++            # over the union of their selected blocks (sparse_attn_tiled.py). Same accuracy
++            # against an fp32 reference as vLLM's kernel; short calls keep vLLM's kernel.
++            if _SPARSE_TILED and int(q_.shape[0]) >= _SPARSE_TILED_MIN_ROWS:
++                return sparse_attn_tiled(
++                    q_, kv_, topk_, bt_, cu_.reshape(-1).tolist(), sl_, pl_.reshape(-1).tolist(),
++                    int(kvh_), float(scale_), out_, tile=8, num_warps=8, num_stages=1,
++                )
++            return original(q_, kv_, topk_, bt_, cu_, sl_, pl_, maxq_, kvh_, scale_, out_)
+         if full_batch:
+             # The whole chunk fits the cap: one call, the milestone-1
+             # behavior with every non-pool argument passed through
+@@ -671,7 +691,7 @@ def _make_prefill_wrapper(original):
+                 block_table, slices[0]["reqs"], slices[0]["pages"], n,
+                 kv_cache.shape[0],
+             )
+-            return original(
++            return attn(
+                 q,
+                 buffer[:n + 1],
+                 topk_idx,
+@@ -695,7 +715,7 @@ def _make_prefill_wrapper(original):
+             cu_new, prefix_new, max_q = ref.prefill_slice_metadata(
+                 s, cu_list, prefix_list, kv_cache.device
+             )
+-            original(
++            attn(
+                 q[qs:qe],
+                 buffer[:n + 1],
+                 topk_idx[:, qs:qe, :],
+diff --git a/src/vllm_exl3/sparse_attn_tiled.py b/src/vllm_exl3/sparse_attn_tiled.py
+new file mode 100644
+index 0000000..34dffd3
+--- /dev/null
++++ b/src/vllm_exl3/sparse_attn_tiled.py
+@@ -0,0 +1,193 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""Query-tiled MiniMax-M3 prefill block-sparse attention.
++
++vLLM's ``_gqa_sparse_fwd_kernel`` runs one program per (query token, kv head) and loads
++the token's ``topk`` selected 128-token KV blocks; consecutive tokens select mostly the
++same blocks, so every block is re-read from L2 by each token that picked it. This
++kernel takes ``T`` consecutive tokens of one request per program, iterates the sorted
++union of their selected blocks, loads each block once, and masks per token so every
++token attends exactly its own selected blocks (and causally, as the original). The
++math is the original's; only the order in which blocks enter the online softmax differs.
++
++Same contract as ``minimax_m3_sparse_attn`` for an unquantized (bf16/fp16) KV pool:
++``kv_cache`` [num_blocks, num_kv_heads, 128, 2*head_dim], ``topk_idx``
++[num_kv_heads, total_q, topk] logical block ids (only the first
++min(topk, (q_abs + 128) // 128) entries of each row are read, as in the original).
++"""
++
++from __future__ import annotations
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++SPARSE_BLOCK = 128
++_INT_MAX = 2**31 - 1
++
++
++@triton.jit
++def _gqa_sparse_tiled_fwd_kernel(
++    q_ptr,  # [total_q, num_heads, D]
++    kv_ptr,  # [num_blocks, num_kv_heads, 128, 2D]
++    o_ptr,  # [total_q, num_heads, D]
++    bt_ptr,  # [num_reqs, max_blocks]
++    tile_q0_ptr,  # [n_tiles] first query row of the tile
++    tile_n_ptr,  # [n_tiles] rows in the tile (<= T)
++    tile_req_ptr,  # [n_tiles] request index
++    tile_qabs0_ptr,  # [n_tiles] absolute position of the first row
++    seq_len_ptr,  # [num_reqs]
++    union_ptr,  # [num_kv_heads, n_tiles, MAXU] sorted logical block ids (INT_MAX pad)
++    ucount_ptr,  # [num_kv_heads, n_tiles]
++    sel_ptr,  # [num_kv_heads, n_tiles, T, MAXU] int8: row t selected union entry u
++    n_tiles,
++    gqa_group_size,
++    head_dim,
++    sm_scale,
++    stride_qn, stride_qh, stride_qd,
++    stride_kv_blk, stride_kv_h, stride_kv_pos, stride_kv_d,
++    stride_on, stride_oh, stride_od,
++    stride_bt_b,
++    T: tl.constexpr,
++    MAXU: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    pid_t = tl.program_id(0)
++    pid_kh = tl.program_id(1)
++    ROWS: tl.constexpr = T * BLOCK_H
++    q0 = tl.load(tile_q0_ptr + pid_t)
++    nrows = tl.load(tile_n_ptr + pid_t)
++    req = tl.load(tile_req_ptr + pid_t)
++    qabs0 = tl.load(tile_qabs0_ptr + pid_t)
++    seq_len = tl.load(seq_len_ptr + req)
++    ucount = tl.load(ucount_ptr + pid_kh * n_tiles + pid_t)
++    bt_row = bt_ptr + req * stride_bt_b
++
++    r = tl.arange(0, ROWS)
++    t_of_r = r // BLOCK_H
++    h_of_r = r % BLOCK_H
++    off_d = tl.arange(0, BLOCK_D)
++    off_n = tl.arange(0, BLOCK_K)
++    row_ok = (t_of_r < nrows) & (h_of_r < gqa_group_size)
++    d_ok = off_d < head_dim
++    head = pid_kh * gqa_group_size + h_of_r
++    q = tl.load(
++        q_ptr + (q0 + t_of_r)[:, None] * stride_qn + head[:, None] * stride_qh + off_d[None, :] * stride_qd,
++        mask=row_ok[:, None] & d_ok[None, :],
++        other=0.0,
++    )
++    qabs = qabs0 + t_of_r
++    scale_log2e = sm_scale * 1.4426950409
++    m_i = tl.full((ROWS,), float("-inf"), dtype=tl.float32)
++    l_i = tl.zeros((ROWS,), dtype=tl.float32)
++    acc = tl.zeros((ROWS, BLOCK_D), dtype=tl.float32)
++    u_base = union_ptr + (pid_kh * n_tiles + pid_t) * MAXU
++    s_base = sel_ptr + (pid_kh * n_tiles + pid_t) * (T * MAXU)
++    for u in range(ucount):
++        blk = tl.load(u_base + u)
++        page = tl.load(bt_row + blk).to(tl.int64)
++        c = blk * BLOCK_K
++        pos = c + off_n
++        pos_ok = pos < seq_len
++        k = tl.load(
++            kv_ptr + page * stride_kv_blk + pid_kh * stride_kv_h + off_n[None, :] * stride_kv_pos
++            + off_d[:, None] * stride_kv_d,
++            mask=d_ok[:, None] & pos_ok[None, :],
++            other=0.0,
++        )
++        sel = tl.load(s_base + t_of_r * MAXU + u) != 0
++        s = tl.dot(q, k) * scale_log2e
++        keep = sel[:, None] & (qabs[:, None] >= pos[None, :]) & pos_ok[None, :]
++        s = tl.where(keep, s, float("-inf"))
++        m_ij = tl.maximum(m_i, tl.max(s, axis=1))
++        m_safe = tl.where(m_ij == float("-inf"), 0.0, m_ij)
++        p = tl.exp2(s - m_safe[:, None])
++        alpha = tl.exp2(m_i - m_safe)
++        l_i = l_i * alpha + tl.sum(p, axis=1)
++        v = tl.load(
++            kv_ptr + page * stride_kv_blk + pid_kh * stride_kv_h + off_n[:, None] * stride_kv_pos
++            + (head_dim + off_d[None, :]) * stride_kv_d,
++            mask=pos_ok[:, None] & d_ok[None, :],
++            other=0.0,
++        )
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_ij
++    acc = acc / tl.where(l_i > 0, l_i, 1.0)[:, None]
++    tl.store(
++        o_ptr + (q0 + t_of_r)[:, None] * stride_on + head[:, None] * stride_oh + off_d[None, :] * stride_od,
++        acc.to(o_ptr.dtype.element_ty),
++        mask=row_ok[:, None] & d_ok[None, :],
++    )
++
++
++def build_tiles(cu_seqlens_q: list[int], prefix_lens: list[int], tile: int, device):
++    """Tiles of ``tile`` consecutive rows that never cross a request boundary."""
++    q0, n, req, qabs0 = [], [], [], []
++    for b in range(len(cu_seqlens_q) - 1):
++        qs, qe = int(cu_seqlens_q[b]), int(cu_seqlens_q[b + 1])
++        for s in range(qs, qe, tile):
++            q0.append(s)
++            n.append(min(tile, qe - s))
++            req.append(b)
++            qabs0.append(int(prefix_lens[b]) + (s - qs))
++    as_t = lambda xs: torch.tensor(xs, dtype=torch.int32, device=device)
++    return as_t(q0), as_t(n), as_t(req), as_t(qabs0)
++
++
++def build_union(topk_idx: torch.Tensor, tile_q0, tile_n, tile_qabs0, tile: int):
++    """Sorted union of each tile's selected blocks, per kv head, and the per-row selection mask."""
++    kvh, total_q, topk = topk_idx.shape
++    n_tiles = tile_q0.numel()
++    dev = topk_idx.device
++    t = torch.arange(tile, device=dev, dtype=torch.int32)
++    rows = tile_q0[:, None] + t[None, :]  # [n_tiles, T]
++    row_ok = t[None, :] < tile_n[:, None]
++    rows_c = torch.where(row_ok, rows, torch.zeros_like(rows)).long()
++    blocks = topk_idx[:, rows_c.reshape(-1), :].reshape(kvh, n_tiles, tile, topk).to(torch.int64)
++    qabs = (tile_qabs0[:, None] + t[None, :]).long()
++    real_topk = torch.clamp((qabs + SPARSE_BLOCK) // SPARSE_BLOCK, max=topk)  # [n_tiles, T]
++    k_ok = torch.arange(topk, device=dev)[None, None, :] < real_topk[:, :, None]
++    ok = (row_ok[:, :, None] & k_ok)[None].expand(kvh, -1, -1, -1)
++    blocks = torch.where(ok, blocks, torch.full_like(blocks, _INT_MAX))
++    flat, _ = blocks.reshape(kvh, n_tiles, tile * topk).sort(dim=-1)
++    first = torch.ones_like(flat, dtype=torch.bool)
++    first[..., 1:] = flat[..., 1:] != flat[..., :-1]
++    first &= flat != _INT_MAX
++    ucount = first.sum(-1).to(torch.int32)
++    maxu = tile * topk
++    # Unique values to their compacted slots; every other entry goes to a dump column.
++    union = torch.full((kvh, n_tiles, maxu + 1), _INT_MAX, dtype=torch.int64, device=dev)
++    slot = torch.where(first, first.long().cumsum(-1) - 1, torch.full_like(flat, maxu))
++    union.scatter_(-1, slot, flat)
++    union = union[..., :maxu].contiguous()  # sorted, INT_MAX padded
++    blk_flat = blocks.reshape(kvh, n_tiles, tile * topk)
++    idx = torch.searchsorted(union, blk_flat)
++    idx = torch.where(ok.reshape(kvh, n_tiles, tile * topk), idx, torch.full_like(idx, maxu))
++    sel = torch.zeros((kvh, n_tiles, tile, maxu + 1), dtype=torch.int8, device=dev)
++    sel.scatter_(-1, idx.view(kvh, n_tiles, tile, topk), torch.ones_like(idx, dtype=torch.int8).view(kvh, n_tiles, tile, topk))
++    sel = sel[..., :maxu].contiguous()
++    return union.to(torch.int32), ucount, sel
++
++
++def sparse_attn_tiled(
++    q, kv_cache, topk_idx, block_table, cu_seqlens_q: list[int], seq_lens, prefix_lens: list[int],
++    num_kv_heads: int, sm_scale: float, output, tile: int = 4, num_warps: int = 4, num_stages: int = 1,
++):
++    total_q, num_heads, head_dim = q.shape
++    gqa = num_heads // num_kv_heads
++    tile_q0, tile_n, tile_req, tile_qabs0 = build_tiles(cu_seqlens_q, prefix_lens, tile, q.device)
++    union, ucount, sel = build_union(topk_idx, tile_q0, tile_n, tile_qabs0, tile)
++    n_tiles = tile_q0.numel()
++    _gqa_sparse_tiled_fwd_kernel[(n_tiles, num_kv_heads)](
++        q, kv_cache, output, block_table, tile_q0, tile_n, tile_req, tile_qabs0, seq_lens,
++        union, ucount, sel, n_tiles, gqa, head_dim, sm_scale,
++        q.stride(0), q.stride(1), q.stride(2),
++        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), kv_cache.stride(3),
++        output.stride(0), output.stride(1), output.stride(2),
++        block_table.stride(0),
++        T=tile, MAXU=tile * topk_idx.shape[-1], BLOCK_H=triton.next_power_of_2(gqa),
++        BLOCK_D=triton.next_power_of_2(head_dim), BLOCK_K=SPARSE_BLOCK,
++        num_warps=num_warps, num_stages=num_stages,
++    )
++    return output
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index 0325ec1..39f1845 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -61,7 +61,7 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_FP8_PREFILL_SKIP", "VLLM_EXL3_BF16_PREFILL", "VLLM_EXL3_BF16_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_MIXEDK_M64_MIN_TOKENS",
+-    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS",
++    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "VLLM_EXL3_SPARSE_TILED", "VLLM_EXL3_SPARSE_TILED_MIN_ROWS",
+ })
+ 
+ try:
+diff --git a/tests/gpu/bench_sparse_attn.py b/tests/gpu/bench_sparse_attn.py
+new file mode 100644
+index 0000000..1544e2a
+--- /dev/null
++++ b/tests/gpu/bench_sparse_attn.py
+@@ -0,0 +1,97 @@
++"""vLLM's MiniMax-M3 prefill sparse attention kernel: launch-parameter sweep (run in the image).
++
++Second 8K chunk of a 16K prompt at TP2 shapes (32 q heads, 2 kv heads, head_dim 128, topk 16 of
++128-token blocks), bf16 staged KV like the q4 prefill path. Outputs compared to the default launch."""
++import time
++import torch
++import vllm.models.minimax_m3.common.ops.sparse_attn as sa
++
++dev = "cuda"
++torch.manual_seed(0)
++Q, PREFIX, H, KVH, D, TOPK = 8192, 8192, 32, 2, 128, 16
++seq = PREFIX + Q
++nblk = seq // 128
++q = (torch.randn(Q, H, D, device=dev) * 0.5).bfloat16()
++kv = (torch.randn(nblk, KVH, 128, 2 * D, device=dev) * 0.5).bfloat16()
++bt = torch.arange(nblk, dtype=torch.int32, device=dev)[None, :]
++pos = PREFIX + torch.arange(Q, device=dev)
++valid = (pos + 128) // 128
++# local block + 15 random valid earlier blocks per token per kv head
++r = torch.rand(KVH, Q, nblk, device=dev)
++r = r.masked_fill(torch.arange(nblk, device=dev)[None, None, :] >= valid[None, :, None], -1)
++r[:, torch.arange(Q), valid - 1] = 2.0
++topk = r.topk(TOPK, dim=-1).indices.to(torch.int32).contiguous()
++cu = torch.tensor([0, Q], dtype=torch.int32, device=dev)
++sl = torch.tensor([seq], dtype=torch.int32, device=dev)
++pl = torch.tensor([PREFIX], dtype=torch.int32, device=dev)
++scale = D ** -0.5
++
++
++def launch(out, **kw):
++    sa._gqa_sparse_fwd_kernel[(Q, KVH, 1)](
++        q, kv, out, out, topk, out, bt, cu, cu, sl, pl, KVH, H // KVH, D, TOPK, 1, scale,
++        q.stride(0), q.stride(1), q.stride(2), kv.stride(0), kv.stride(1), kv.stride(2), kv.stride(3),
++        0, 0, 0, 0, topk.stride(0), topk.stride(1), topk.stride(2), out.stride(0), out.stride(1), out.stride(2),
++        bt.stride(0), BLOCK_SIZE_Q=1, BLOCK_SIZE_K=128, USE_FP8=False, KV_SCALE_MODE=0, **kw)
++
++
++def timeit(fn, n=10):
++    fn(); torch.cuda.synchronize(); t = time.perf_counter()
++    for _ in range(n): fn()
++    torch.cuda.synchronize(); return (time.perf_counter() - t) / n * 1e3
++
++
++ref = torch.empty_like(q)
++launch(ref)
++t0 = timeit(lambda: launch(ref))
++print(f"default: {t0:.2f} ms")
++for nw in (2, 4, 8):
++    for ns in (1, 2, 3, 4):
++        out = torch.empty_like(q)
++        try:
++            launch(out, num_warps=nw, num_stages=ns)
++            t = timeit(lambda: launch(out, num_warps=nw, num_stages=ns))
++            rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
++            print(f"num_warps={nw} num_stages={ns}: {t:.2f} ms ({t0 / t:.2f}x) rel {rel:.1e}")
++        except Exception as exc:
++            print(f"num_warps={nw} num_stages={ns}: ERR {str(exc)[:80]}")
++
++# Query-tiled kernel (vllm_exl3.sparse_attn_tiled): same inputs, metadata build included.
++import sys
++sys.path.insert(0, "/src/src")
++from vllm_exl3.sparse_attn_tiled import sparse_attn_tiled, build_tiles, build_union
++
++for tile, nw in ((2, 4), (4, 4), (4, 8), (8, 8)):
++    out = torch.empty_like(q)
++    sparse_attn_tiled(q, kv, topk, bt, [0, Q], sl, [PREFIX], KVH, scale, out, tile=tile, num_warps=nw)
++    torch.cuda.synchronize()
++    rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
++    worst = ((out.float() - ref.float()).abs().max()).item()
++    t = timeit(lambda: sparse_attn_tiled(q, kv, topk, bt, [0, Q], sl, [PREFIX], KVH, scale, out, tile=tile, num_warps=nw))
++    tq = build_tiles([0, Q], [PREFIX], tile, dev)
++    tm = timeit(lambda: build_union(topk, tq[0], tq[1], tq[3], tile))
++    u = build_union(topk, tq[0], tq[1], tq[3], tile)[1].float().mean().item()
++    print(f"tiled T={tile} warps={nw}: {t:.2f} ms ({t0 / t:.2f}x; metadata {tm:.2f} ms; mean union {u:.1f} blocks) rel {rel:.1e} max|d| {worst:.1e}")
++
++# Prefix-free first chunk (early tokens with fewer valid blocks than topk).
++Q2 = 4096
++q2 = q[:Q2].contiguous()
++pos2 = torch.arange(Q2, device=dev)
++valid2 = (pos2 + 128) // 128
++r2 = torch.rand(KVH, Q2, nblk, device=dev)
++r2 = r2.masked_fill(torch.arange(nblk, device=dev)[None, None, :] >= valid2[None, :, None], -1)
++r2[:, torch.arange(Q2), valid2 - 1] = 2.0
++topk2 = r2.topk(TOPK, dim=-1).indices.to(torch.int32).contiguous()
++cu2 = torch.tensor([0, Q2], dtype=torch.int32, device=dev)
++sl2 = torch.tensor([Q2], dtype=torch.int32, device=dev)
++pl2 = torch.tensor([0], dtype=torch.int32, device=dev)
++ref2 = torch.empty_like(q2)
++sa._gqa_sparse_fwd_kernel[(Q2, KVH, 1)](
++    q2, kv, ref2, ref2, topk2, ref2, bt, cu2, cu2, sl2, pl2, KVH, H // KVH, D, TOPK, 1, scale,
++    q2.stride(0), q2.stride(1), q2.stride(2), kv.stride(0), kv.stride(1), kv.stride(2), kv.stride(3),
++    0, 0, 0, 0, topk2.stride(0), topk2.stride(1), topk2.stride(2), ref2.stride(0), ref2.stride(1), ref2.stride(2),
++    bt.stride(0), BLOCK_SIZE_Q=1, BLOCK_SIZE_K=128, USE_FP8=False, KV_SCALE_MODE=0)
++out2 = torch.empty_like(q2)
++sparse_attn_tiled(q2, kv, topk2, bt, [0, Q2], sl2, [0], KVH, scale, out2, tile=4)
++torch.cuda.synchronize()
++print(f"first chunk (no prefix): rel {((out2.float() - ref2.float()).norm() / ref2.float().norm()).item():.1e}")
+diff --git a/tests/gpu/bench_sparse_attn_real.py b/tests/gpu/bench_sparse_attn_real.py
+new file mode 100644
+index 0000000..32ceb97
+--- /dev/null
++++ b/tests/gpu/bench_sparse_attn_real.py
+@@ -0,0 +1,44 @@
++"""Tiled vs vLLM sparse attention on a captured real topk_idx (run in the image, /cache mounted)."""
++import sys, time
++import torch
++sys.path.insert(0, "/src/src")
++import vllm.models.minimax_m3.common.ops.sparse_attn as sa
++from vllm_exl3.sparse_attn_tiled import sparse_attn_tiled, build_tiles, build_union
++
++dev = "cuda"
++d = torch.load("/cache/topk_dump.pt")
++topk = d["topk_idx"].to(dev).contiguous()
++cu = d["cu"].to(dev); pl = d["prefix"].to(dev); sl = d["seq_lens"].to(dev)
++KVH, Q, TOPK = topk.shape
++cu_l = cu.tolist(); pl_l = pl.tolist()
++print("topk_idx", tuple(topk.shape), "cu", cu_l, "prefix", pl_l, "seq_lens", sl.tolist())
++H, D = 16 * KVH, 128
++seq = int(sl.max())
++nblk = (seq + 127) // 128
++torch.manual_seed(0)
++q = (torch.randn(Q, H, D, device=dev) * 0.5).bfloat16()
++kv = (torch.randn(nblk, KVH, 128, 2 * D, device=dev) * 0.5).bfloat16()
++bt = torch.arange(nblk, dtype=torch.int32, device=dev)[None, :].repeat(len(cu_l) - 1, 1).contiguous()
++scale = D ** -0.5
++
++
++def timeit(fn, n=10):
++    fn(); torch.cuda.synchronize(); t = time.perf_counter()
++    for _ in range(n): fn()
++    torch.cuda.synchronize(); return (time.perf_counter() - t) / n * 1e3
++
++
++ref = torch.empty_like(q)
++orig = lambda: sa.minimax_m3_sparse_attn(q, kv, topk, bt, cu, sl, pl, int(max(cu_l[i+1]-cu_l[i] for i in range(len(cu_l)-1))), KVH, scale, ref)
++orig()
++t0 = timeit(orig)
++print(f"vLLM kernel: {t0:.2f} ms")
++for tile, nw, ns in ((8, 4, 1), (8, 8, 1), (8, 8, 2), (8, 8, 3), (8, 16, 1)):
++    out = torch.empty_like(q)
++    fn = lambda: sparse_attn_tiled(q, kv, topk, bt, cu_l, sl, pl_l, KVH, scale, out, tile=tile, num_warps=nw, num_stages=ns)
++    fn(); torch.cuda.synchronize()
++    rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
++    t = timeit(fn)
++    tq = build_tiles(cu_l, pl_l, tile, dev)
++    u = build_union(topk, tq[0], tq[1], tq[3], tile)[1].float().mean().item()
++    print(f"tiled T={tile:2d} warps={nw} stages={ns}: {t:.2f} ms ({t0 / t:.2f}x) mean union {u:.1f} blocks (vs {tile * TOPK} unshared) rel {rel:.1e}")
+diff --git a/tests/gpu/test_sparse_attn_tiled.py b/tests/gpu/test_sparse_attn_tiled.py
+new file mode 100644
+index 0000000..9fd05d1
+--- /dev/null
++++ b/tests/gpu/test_sparse_attn_tiled.py
+@@ -0,0 +1,83 @@
++"""Tiled sparse attention vs vLLM's kernel on short and multi-request prefills (run in the image)."""
++import sys
++import torch
++sys.path.insert(0, "/src/src")
++import vllm.models.minimax_m3.common.ops.sparse_attn as sa
++from vllm_exl3.sparse_attn_tiled import sparse_attn_tiled
++
++dev = "cuda"
++torch.manual_seed(0)
++KVH, H, D, TOPK = 2, 32, 128, 16
++fails = 0
++
++
++def case(lens, prefixes, name):
++    global fails
++    total = sum(lens)
++    seqs = [p + l for p, l in zip(prefixes, lens)]
++    nblk_req = [(s + 127) // 128 for s in seqs]
++    nblk = sum(nblk_req) + 1
++    q = (torch.randn(total, H, D, device=dev) * 0.5).bfloat16()
++    kv = (torch.randn(nblk, KVH, 128, 2 * D, device=dev) * 0.5).bfloat16()
++    maxb = max(nblk_req)
++    bt = torch.zeros(len(lens), maxb, dtype=torch.int32, device=dev)
++    off = 0
++    for b, n in enumerate(nblk_req):
++        bt[b, :n] = torch.arange(off, off + n, dtype=torch.int32)
++        off += n
++    topk = torch.zeros(KVH, total, TOPK, dtype=torch.int32, device=dev)
++    row = 0
++    for b, (l, p) in enumerate(zip(lens, prefixes)):
++        for i in range(l):
++            valid = (p + i + 128) // 128
++            perm = torch.randperm(valid, device=dev)
++            sel = torch.cat([torch.tensor([valid - 1], device=dev), perm[perm != valid - 1]])[:TOPK]
++            sel = torch.cat([sel, torch.full((TOPK - sel.numel(),), 0, device=dev, dtype=sel.dtype)])  # garbage tail like serving
++            topk[:, row, :] = sel.to(torch.int32)
++            row += 1
++    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.int32, device=dev)
++    sl = torch.tensor(seqs, dtype=torch.int32, device=dev)
++    pl = torch.tensor(prefixes, dtype=torch.int32, device=dev)
++    ref = torch.zeros_like(q)
++    sa.minimax_m3_sparse_attn(q, kv, topk, bt, cu, sl, pl, max(lens), KVH, D ** -0.5, ref)
++    out = torch.zeros_like(q)
++    sparse_attn_tiled(q, kv, topk, bt, cu.tolist(), sl, prefixes, KVH, D ** -0.5, out, tile=8, num_warps=8, num_stages=1)
++    torch.cuda.synchronize()
++    # fp32 ground truth over each row's selected, causal keys.
++    exact = torch.zeros(total, H, D, dtype=torch.float32, device=dev)
++    row = 0
++    for b, (l, p) in enumerate(zip(lens, prefixes)):
++        for i in range(l):
++            qa = p + i
++            valid = (qa + 128) // 128
++            blks = topk[:, row, :min(TOPK, valid)].long()
++            for kh in range(KVH):
++                pages = bt[b, blks[kh]].long()
++                kk = kv[pages, kh, :, :D].float().reshape(-1, D)
++                vv = kv[pages, kh, :, D:].float().reshape(-1, D)
++                kpos = (blks[kh][:, None] * 128 + torch.arange(128, device=dev)[None, :]).reshape(-1)
++                qq = q[row, kh * 16:(kh + 1) * 16].float()
++                sc = (qq @ kk.T) * D ** -0.5
++                sc = sc.masked_fill((kpos > qa)[None, :], float("-inf"))
++                exact[row, kh * 16:(kh + 1) * 16] = torch.softmax(sc, dim=-1) @ vv
++            row += 1
++    e_ref = ((ref.float() - exact).norm() / exact.norm()).item()
++    e_out = ((out.float() - exact).norm() / exact.norm()).item()
++    print(f"  vs fp32 exact: vLLM kernel {e_ref:.2e} | tiled {e_out:.2e}")
++    if e_out > 1.2 * e_ref + 1e-4:
++        fails += 1
++        print("  FAIL: tiled is less accurate than vLLM's kernel")
++    row_rel = ((out.float() - ref.float()).norm(dim=(1, 2)) / ref.float().norm(dim=(1, 2)).clamp(min=1e-6))
++    ok = row_rel.max().item() < 1e-2 and torch.isfinite(out).all().item()
++    fails += not ok
++    print(f"{name}: rows {total}, worst row rel {row_rel.max().item():.1e} at row {int(row_rel.argmax())} {'OK' if ok else 'FAIL'}")
++
++
++case([48], [0], "single 48-token prompt")
++case([129], [0], "single 129-token prompt")
++case([5], [0], "5 tokens")
++case([33, 48, 7], [0, 0, 0], "three requests")
++case([100], [300], "100 tokens after 300 prefix")
++case([512], [0], "512 tokens")
++case([256], [1024], "256 tokens after 1024 prefix")
++sys.exit(1 if fails else 0)
+-- 
+2.51.0
+

@@ -1,0 +1,527 @@
+From 10b691d26a77c80a91d60e1c3cb611e43055e7ad Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:04:18 -0500
+Subject: [PATCH] Grouped fat GEMM: cp.async multistage pipeline, skip empty
+ M-blocks
+
+A rows and trellis words stream global -> shared with cp.async through
+5 stages of 32-wide K (4 for K >= 4) instead of a register-staged
+64-wide prefetch; one barrier per stage, placed so the stage's last MMAs
+issue before the next copy and dequant. M-blocks past an expert's last
+row skip their loads and MMAs. Epilogue stages 32 rows per round in a
+padded (bank-conflict-free) tile, preloads routing per row and drops
+one barrier per round. Accumulation order unchanged: grouped output is
+still bit-identical to the per-expert kernel.
+
+GB10, live MiniMax-M3.1 TP2 shapes (125 experts, 33,173 rows):
+gate|up K2 21.3 -> 17.7 ms, down K2 scatter 14.1 -> 13.1 ms,
+gate|up K3 21.0 -> 17.6 ms, down K3 scatter 14.9 -> 13.3 ms.
+bench_fat_grouped_shapes.py now runs those live shapes.
+---
+ CHANGELOG.md                          |  10 +
+ csrc/exl3_fat_gemm.cu                 | 306 ++++++++++++++++----------
+ tests/gpu/bench_fat_grouped_shapes.py |  58 +++--
+ 3 files changed, 239 insertions(+), 135 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f2852d2..05b6d89 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -62,6 +62,16 @@
+ 
+ ### Changed
+ 
++- Grouped fat-expert GEMM (`exl3_fat_gemm_grouped`): A rows and trellis words now stream
++  global -> shared with `cp.async` through a 5-stage pipeline (4 for K >= 4) of 32-wide K
++  stages instead of a register-staged 64-wide prefetch, with one barrier per stage placed so
++  the stage's last MMAs issue before the next copy and dequant; M-blocks past an expert's last
++  row skip their MMAs; the epilogue stages 32 rows per round in a bank-conflict-free padded
++  tile. Outputs are bit-identical to the per-expert kernel (same per-element K order). GB10,
++  live MiniMax-M3.1 TP2 shapes (125 experts, 33,173 rows): gate|up K2 21.3 -> 17.7 ms
++  (58.7 -> 70.6 TFLOPS), down K2 scatter 14.1 -> 13.1 ms, gate|up K3 21.0 -> 17.6 ms, down K3
++  14.9 -> 13.3 ms.
++
+ - Unified `exl3_moe_mixedk` is the default mixed-K dispatch on every device.
+   Per-K-group dispatch costs one launch plus ~9 ATen kernels per K tuple per
+   layer per step at `MOE_SMS_PER_EXPERT` = 8 CTAs of 48, and at decode a group
+diff --git a/csrc/exl3_fat_gemm.cu b/csrc/exl3_fat_gemm.cu
+index 19531d6..125527b 100644
+--- a/csrc/exl3_fat_gemm.cu
++++ b/csrc/exl3_fat_gemm.cu
+@@ -29,7 +29,24 @@ constexpr int FAT_TILE_K = 16;
+ constexpr int FAT_TILE_N = 128;
+ constexpr int FAT_M_BLOCKS = FAT_TILE_M / 16;
+ constexpr int FAT_N_BLOCKS = FAT_TILE_N / 16;
+-constexpr int FAT_K_SUB = 4;  // grouped kernel: 16-wide K sub-blocks per pipeline stage
++constexpr int FAT_G_KSUB = 2;  // grouped kernel: 16-wide K sub-blocks per pipeline stage
++// Epilogue staging: rows of FAT_TILE_N floats padded to 136 so the fragment stores
++// (float2, eight rows x four column pairs per half-warp) hit distinct banks.
++constexpr int FAT_C_STRIDE = FAT_TILE_N + 8;
++constexpr int FAT_EPI_ROWS = 32;
++
++// Grouped-kernel shared bytes per pipeline stage (A rows plus trellis words), and the depth:
++// five stages where they fit the 48 KiB that keeps two CTAs per SM (K <= 3), four otherwise.
++template <int K>
++constexpr int fat_g_stage_bytes()
++{
++    return FAT_G_KSUB * (FAT_TILE_M * FAT_TILE_K * 2 + FAT_N_BLOCKS * 16 * K * 2);
++}
++template <int K>
++constexpr int fat_g_stages()
++{
++    return 5 * fat_g_stage_bytes<K>() <= 48 * 1024 ? 5 : 4;
++}
+ constexpr float HAD_SCALE = 0.088388347648f;
+ 
+ __device__ inline void fat_had_ff_128(
+@@ -201,9 +218,32 @@ void exl3_fat_gemm_kernel(
+     }
+ }
+ 
+-// One 16x16 trellis tile packs 256 weights at K bits: 16 * K int16 words.
++__device__ __forceinline__ void fat_cp_async16(void* smem_ptr, const void* glob_ptr)
++{
++    const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(glob_ptr) : "memory");
++}
++
++__device__ __forceinline__ void fat_cp_commit()
++{
++    asm volatile("cp.async.commit_group;\n" ::: "memory");
++}
++
++template <int n>
++__device__ __forceinline__ void fat_cp_wait()
++{
++    asm volatile("cp.async.wait_group %0;\n" :: "n"(n) : "memory");
++}
++
++// Grouped kernel. Warp w owns 16-column N-block w for all 128 rows and dequantizes its
++// trellis tile in registers (each tile once per CTA). A rows and trellis words go
++// global -> shared with cp.async: STAGES buffers of FAT_G_KSUB 16-wide sub-blocks, STAGES - 2
++// of them in flight ahead of the one being read. One barrier per stage, at the top of the
++// stage's last sub-block: its MMAs read resident data and issue first, then the next copy and
++// the next stage's first dequant run while they drain. The per-element accumulation order is
++// the plain K order of the per-expert kernel, so outputs match it bit for bit.
+ template <int K, int CB, bool scatter>
+-__global__ __launch_bounds__(FAT_THREADS, 2)  // two CTAs per SM: 131 -> <=128 registers
++__global__ __launch_bounds__(FAT_THREADS, 2)
+ void exl3_fat_gemm_grouped_kernel(
+     const half* __restrict__ a,
+     const int64_t* __restrict__ packed_ptrs,
+@@ -215,25 +255,74 @@ void exl3_fat_gemm_grouped_kernel(
+     int size_k,
+     int size_n)
+ {
+-    constexpr int FAT_PACKED_WORDS = 16 * K;
+-    extern __shared__ unsigned char shared_raw[];
++    constexpr int STAGES = fat_g_stages<K>();
++    constexpr int KSUB = FAT_G_KSUB;
++    constexpr int WARPS = FAT_THREADS / 32;
++    constexpr int PW = 16 * K;                          // int16 words per 16x16 trellis tile
++    constexpr int A_SUB = FAT_TILE_M * FAT_TILE_K;      // halfs per A sub-block
++    constexpr int B_SUB = FAT_N_BLOCKS * PW;            // words per B sub-block
++    constexpr int A_STAGE = KSUB * A_SUB;
++    constexpr int B_STAGE = KSUB * B_SUB;
++    constexpr int A_CHUNKS = FAT_TILE_M * KSUB * 2;     // 16-byte pieces of A per stage
++    constexpr int B_CHUNKS = KSUB * B_SUB / 8;          // 16-byte pieces of B per stage
++    constexpr int ROWS_PER_WARP = FAT_EPI_ROWS / WARPS; // epilogue rows each warp transforms per round
++    static_assert(STAGES >= 3, "one stage is read, one is being replaced, the rest are in flight");
++    static_assert(KSUB % 2 == 0, "B fragment double buffer alternates by sub-block");
++    static_assert(WARPS == FAT_N_BLOCKS, "one 16-column N-block per warp");
++    static_assert(A_CHUNKS % FAT_THREADS == 0 && B_CHUNKS <= FAT_THREADS, "stage copy mapping");
++    static_assert(FAT_EPI_ROWS * FAT_C_STRIDE * 4 <= STAGES * A_STAGE * 2, "epilogue staging fits in A");
++
++    extern __shared__ __align__(16) unsigned char shared_raw[];
+     half* sh_a = reinterpret_cast<half*>(shared_raw);
+-    uint16_t* sh_b = reinterpret_cast<uint16_t*>(sh_a + FAT_K_SUB * FAT_TILE_M * FAT_TILE_K);
+-    float* sh_c = reinterpret_cast<float*>(sh_b + FAT_K_SUB * FAT_N_BLOCKS * FAT_PACKED_WORDS);
++    uint16_t* sh_b = reinterpret_cast<uint16_t*>(sh_a + STAGES * A_STAGE);
++    float* sh_c = reinterpret_cast<float*>(shared_raw);  // after the main loop drains
+ 
+-    int t = threadIdx.x;
+-    int warp = t / 32;
+-    int lane = t & 31;
++    const int t = threadIdx.x;
++    const int warp = t / 32;
++    const int lane = t & 31;
+     // Grouped: blockIdx.z selects the expert; its rows are [row_bounds[2z], row_bounds[2z + 1])
+     // of the shared, expert-sorted ``a`` and its trellis/svh come from the pointer tables.
+     const int g = blockIdx.z;
+     const int size_m = row_bounds[2 * g + 1];
+-    int m_base = row_bounds[2 * g] + blockIdx.y * FAT_TILE_M;
++    const int m_base = row_bounds[2 * g] + blockIdx.y * FAT_TILE_M;
+     if (m_base >= size_m) return;
+     const uint16_t* __restrict__ packed = reinterpret_cast<const uint16_t*>(packed_ptrs[g]);
+     const half* __restrict__ svh = reinterpret_cast<const half*>(svh_ptrs[g]);
+-    int n_base = blockIdx.x * FAT_TILE_N;
+-    int tiles_n = size_n / 16;
++    const int n_base = blockIdx.x * FAT_TILE_N;
++    const int tiles_n = size_n / 16;
++    const int stages = size_k / (FAT_TILE_K * KSUB);
++    // M-blocks past this expert's last row hold no output: their loads and MMAs are skipped.
++    const int mb_valid = min(FAT_M_BLOCKS, (size_m - m_base + 15) / 16);
++
++    auto issue_stage = [&](int stage) {
++        if (stage < stages)
++        {
++            half* a_dst = sh_a + (stage % STAGES) * A_STAGE;
++            #pragma unroll
++            for (int i = 0; i < A_CHUNKS / FAT_THREADS; ++i)
++            {
++                const int c = t + i * FAT_THREADS;
++                const int row = c / (2 * KSUB);
++                const int kc = c % (2 * KSUB);  // sub-block kc / 2, 8-half column kc & 1
++                if (m_base + row < size_m)
++                    fat_cp_async16(a_dst + (kc >> 1) * A_SUB + row * 16 + (((kc & 1) ^ ((row >> 2) & 1)) << 3),
++                                   a + static_cast<size_t>(m_base + row) * size_k + stage * KSUB * FAT_TILE_K + kc * 8);
++            }
++            if (t < B_CHUNKS)
++            {
++                const int sub = t / (B_SUB / 8);
++                const int c = t % (B_SUB / 8);
++                fat_cp_async16(sh_b + (stage % STAGES) * B_STAGE + sub * B_SUB + c * 8,
++                               packed + (static_cast<size_t>(stage * KSUB + sub) * tiles_n + n_base / 16) * PW + c * 8);
++            }
++        }
++        fat_cp_commit();  // empty groups past the end keep the wait counts uniform
++    };
++    auto dq_sub = [&](int stage, int sub, FragB& b0, FragB& b1) {
++        dq_dispatch<K, CB>(reinterpret_cast<const uint32_t*>(
++                               sh_b + (stage % STAGES) * B_STAGE + sub * B_SUB + warp * PW),
++                           lane << 3, b0, b1);
++    };
+ 
+     FragC frag_c[FAT_M_BLOCKS][2];
+     #pragma unroll
+@@ -243,130 +332,125 @@ void exl3_fat_gemm_grouped_kernel(
+         frag_c[mb][1] = {};
+     }
+ 
+-    // Stages of FAT_K_SUB 16-wide sub-blocks; the next stage's A/B words are held in
+-    // registers (loads in flight) while this stage's MMAs run.
+-    const int a_row = t / 2;
+-    const int a_col8 = t & 1;
+-    const int a_dst_col8 = a_col8 ^ ((a_row >> 2) & 1);
+-    const bool a_valid = m_base + a_row < size_m;
+-    const half* a_row_ptr = a + static_cast<size_t>(m_base + a_row) * size_k;
+-    int4 reg_a[FAT_K_SUB];
+-    int4 reg_b[FAT_K_SUB];
+-    auto load_stage = [&](int stage) {
+-        #pragma unroll
+-        for (int sub = 0; sub < FAT_K_SUB; ++sub)
+-        {
+-            const int k_block = stage * FAT_K_SUB + sub;
+-            reg_a[sub] = a_valid
+-                ? reinterpret_cast<const int4*>(a_row_ptr + k_block * FAT_TILE_K)[a_col8]
+-                : int4{};
+-            if (t < 16 * K)
+-                reg_b[sub] = reinterpret_cast<const int4*>(
+-                    packed + (static_cast<size_t>(k_block) * tiles_n + n_base / 16) * FAT_PACKED_WORDS)[t];
+-        }
+-    };
+-    const int stages = size_k / (FAT_TILE_K * FAT_K_SUB);
+-    load_stage(0);
++    // Stage n is issued at the barrier of stage n - STAGES + 1, into the buffer stage
++    // n - STAGES (= n mod STAGES) used; every warp is past that stage once the barrier releases.
++    #pragma unroll
++    for (int s = 0; s < STAGES - 2; ++s) issue_stage(s);
++    fat_cp_wait<STAGES - 3>();
++    __syncthreads();
++    issue_stage(STAGES - 2);
++
++    FragB frag_b0[2];
++    FragB frag_b1[2];
++    dq_sub(0, 0, frag_b0[0], frag_b1[0]);
++    const int a_row_lane = (lane % 8) + 8 * ((lane / 8) % 2);
++    const int a_col_lane = lane / 16;
++
+     for (int stage = 0; stage < stages; ++stage)
+     {
++        const int4* stage_a = reinterpret_cast<const int4*>(sh_a + (stage % STAGES) * A_STAGE);
+         #pragma unroll
+-        for (int sub = 0; sub < FAT_K_SUB; ++sub)
++        for (int sub = 0; sub < KSUB; ++sub)
+         {
+-            reinterpret_cast<int4*>(sh_a + sub * FAT_TILE_M * FAT_TILE_K)[a_row * 2 + a_dst_col8] = reg_a[sub];
+-            if (t < 16 * K)
+-                reinterpret_cast<int4*>(sh_b + sub * FAT_N_BLOCKS * FAT_PACKED_WORDS)[t] = reg_b[sub];
+-        }
+-        __syncthreads();
+-        if (stage + 1 < stages) load_stage(stage + 1);
+-
+-        // B fragments are dequantized one sub-block ahead, so the next sub-block's shared
+-        // loads and ALU work overlap this sub-block's MMAs.
+-        FragB frag_b0[2];
+-        FragB frag_b1[2];
+-        dq_dispatch<K, CB>(reinterpret_cast<const uint32_t*>(sh_b + warp * FAT_PACKED_WORDS), lane << 3,
+-                           frag_b0[0], frag_b1[0]);
+-        #pragma unroll
+-        for (int sub = 0; sub < FAT_K_SUB; ++sub)
+-        {
+-            if (sub + 1 < FAT_K_SUB)
+-                dq_dispatch<K, CB>(reinterpret_cast<const uint32_t*>(
+-                                       sh_b + (sub + 1) * FAT_N_BLOCKS * FAT_PACKED_WORDS + warp * FAT_PACKED_WORDS),
+-                                   lane << 3, frag_b0[(sub + 1) & 1], frag_b1[(sub + 1) & 1]);
+-            const FragB& cur_b0 = frag_b0[sub & 1];
+-            const FragB& cur_b1 = frag_b1[sub & 1];
+-            const int4* sub_a = reinterpret_cast<const int4*>(sh_a + sub * FAT_TILE_M * FAT_TILE_K);
+-
++            const int cur = sub & 1;
++            const bool boundary = sub + 1 == KSUB && stage + 1 < stages;
++            if (sub + 1 < KSUB)
++            {
++                dq_sub(stage, sub + 1, frag_b0[cur ^ 1], frag_b1[cur ^ 1]);
++            }
++            else if (boundary)
++            {
++                fat_cp_wait<STAGES - 3>();
++                __syncthreads();
++            }
++            const int4* sub_a = stage_a + sub * (A_SUB / 8);
+             #pragma unroll
+             for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
+             {
++                if (mb >= mb_valid) break;
+                 FragA frag_a;
+-                int row = (lane % 8) + 8 * ((lane / 8) % 2) + mb * 16;
+-                int base_col = lane / 16;
+-                int swizzled_col = base_col ^ ((row >> 2) & 1);
+-                ldsm4(frag_a, const_cast<int4*>(sub_a) + row * 2 + swizzled_col);
+-                ptx_mma_m16n8k16(frag_a, cur_b0, frag_c[mb][0]);
+-                ptx_mma_m16n8k16(frag_a, cur_b1, frag_c[mb][1]);
++                const int row = a_row_lane + mb * 16;
++                ldsm4(frag_a, sub_a + row * 2 + (a_col_lane ^ ((row >> 2) & 1)));
++                ptx_mma_m16n8k16(frag_a, frag_b0[cur], frag_c[mb][0]);
++                ptx_mma_m16n8k16(frag_a, frag_b1[cur], frag_c[mb][1]);
++            }
++            if (boundary)
++            {
++                issue_stage(stage + STAGES - 1);
++                dq_sub(stage + 1, 0, frag_b0[cur ^ 1], frag_b1[cur ^ 1]);
+             }
+         }
+-        __syncthreads();
+     }
++    fat_cp_wait<0>();
++    __syncthreads();
+ 
+     #pragma unroll
+-    for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
++    for (int mp = 0; mp < FAT_M_BLOCKS; mp += FAT_EPI_ROWS / 16)
+     {
+-        int rows = min(16, size_m - (m_base + mb * 16));
++        const int rows = min(FAT_EPI_ROWS, size_m - (m_base + mp * 16));
+         if (rows <= 0) break;
+-        int row0 = lane / 4;
+-        int row1 = row0 + 8;
+-        int col = (lane % 4) * 2;
+-        int n0 = warp * 16;
+-        if (row0 < rows)
++        // Warp w transforms and stores rows w + WARPS * j. Their routing loads are issued
++        // here so they land while the tile is staged.
++        int64_t destination[ROWS_PER_WARP];
++        float weight[ROWS_PER_WARP];
++        if constexpr (scatter)
+         {
+-            float* dst0 = sh_c + row0 * FAT_TILE_N + n0 + col;
+-            dst0[0] = frag_c[mb][0][0];
+-            dst0[1] = frag_c[mb][0][1];
+-            dst0[8] = frag_c[mb][1][0];
+-            dst0[9] = frag_c[mb][1][1];
+-        }
+-        if (row1 < rows)
+-        {
+-            float* dst1 = sh_c + row1 * FAT_TILE_N + n0 + col;
+-            dst1[0] = frag_c[mb][0][2];
+-            dst1[1] = frag_c[mb][0][3];
+-            dst1[8] = frag_c[mb][1][2];
+-            dst1[9] = frag_c[mb][1][3];
++            #pragma unroll
++            for (int j = 0; j < ROWS_PER_WARP; ++j)
++            {
++                const int row = warp + j * WARPS;
++                if (row < rows)
++                {
++                    destination[j] = token_idx[m_base + mp * 16 + row];
++                    weight[j] = __half2float(route_weight[m_base + mp * 16 + row]);
++                }
++            }
+         }
+-        __syncthreads();
+-
+-        for (int row = warp; row < rows; row += 8)
++        const int col = warp * 16 + (lane % 4) * 2;
++        #pragma unroll
++        for (int j = 0; j < FAT_EPI_ROWS / 16; ++j)
+         {
+-            fat_had_ff_128(
+-                sh_c + row * FAT_TILE_N,
+-                sh_c + row * FAT_TILE_N,
+-                svh + n_base);
++            const int row0 = j * 16 + lane / 4;
++            const int row1 = row0 + 8;
++            FragC& c0 = frag_c[mp + j][0];
++            FragC& c1 = frag_c[mp + j][1];
++            if (row0 < rows)
++            {
++                float* dst = sh_c + row0 * FAT_C_STRIDE + col;
++                *reinterpret_cast<float2*>(dst) = make_float2(c0[0], c0[1]);
++                *reinterpret_cast<float2*>(dst + 8) = make_float2(c1[0], c1[1]);
++            }
++            if (row1 < rows)
++            {
++                float* dst = sh_c + row1 * FAT_C_STRIDE + col;
++                *reinterpret_cast<float2*>(dst) = make_float2(c0[2], c0[3]);
++                *reinterpret_cast<float2*>(dst + 8) = make_float2(c1[2], c1[3]);
++            }
+         }
+         __syncthreads();
+ 
+-        // Four consecutive columns per thread: float4 stores, and for the scatter one
+-        // vector reduction (red.global.add.v4.f32, sm_90+) instead of four scalar atomics.
+-        for (int i = t; i < rows * (FAT_TILE_N / 4); i += FAT_THREADS)
++        // Each lane transforms and stores the same four columns of the row: no exchange.
++        #pragma unroll
++        for (int j = 0; j < ROWS_PER_WARP; ++j)
+         {
+-            int row = i / (FAT_TILE_N / 4);
+-            int col_out = (i % (FAT_TILE_N / 4)) * 4;
+-            int source_row = m_base + mb * 16 + row;
+-            float4 v = *reinterpret_cast<const float4*>(sh_c + row * FAT_TILE_N + col_out);
++            const int row = warp + j * WARPS;
++            if (row >= rows) break;
++            float* c_row = sh_c + row * FAT_C_STRIDE;
++            fat_had_ff_128(c_row, c_row, svh + n_base);
++            const int col_out = lane * 4;
++            const float4 v = *reinterpret_cast<const float4*>(c_row + col_out);
+             if constexpr (scatter)
+             {
+-                int64_t destination = token_idx[source_row];
+-                float w = __half2float(route_weight[source_row]);
+-                float* dst = out + destination * size_n + n_base + col_out;
+-                // Experts of one launch can share a token: accumulate atomically.
++                const float w = weight[j];
++                float* dst = out + destination[j] * size_n + n_base + col_out;
++                // Experts of one launch can share a token: accumulate atomically
++                // (red.global.add.v4.f32, sm_90+: one vector reduction per four columns).
+                 asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+                              :: "l"(dst), "f"(v.x * w), "f"(v.y * w), "f"(v.z * w), "f"(v.w * w) : "memory");
+             }
+             else
+             {
+-                *reinterpret_cast<float4*>(out + static_cast<size_t>(source_row) * size_n + n_base + col_out) = v;
++                *reinterpret_cast<float4*>(out + static_cast<size_t>(m_base + mp * 16 + row) * size_n + n_base + col_out) = v;
+             }
+         }
+         __syncthreads();
+@@ -541,9 +625,7 @@ void launch_grouped_k(
+     int size_k = static_cast<int>(a.size(1));
+     dim3 block(FAT_THREADS);
+     dim3 grid(static_cast<int>(size_n) / FAT_TILE_N, (static_cast<int>(max_rows) + FAT_TILE_M - 1) / FAT_TILE_M, groups);
+-    size_t shared = FAT_K_SUB * FAT_TILE_M * FAT_TILE_K * sizeof(half)
+-                  + FAT_K_SUB * FAT_N_BLOCKS * 16 * K * sizeof(uint16_t)
+-                  + 16 * FAT_TILE_N * sizeof(float);
++    const size_t shared = static_cast<size_t>(fat_g_stages<K>()) * fat_g_stage_bytes<K>();
+     exl3_fat_gemm_grouped_kernel<K, CB, scatter><<<grid, block, shared, stream>>>(
+         reinterpret_cast<const half*>(a.data_ptr()),
+         reinterpret_cast<const int64_t*>(packed_ptrs.data_ptr()),
+@@ -638,7 +720,7 @@ void exl3_fat_gemm_grouped(
+                 "row_bounds must be int32 [2 * groups] (start, end) pairs");
+     TORCH_CHECK(K >= 1 && K <= 8, "K 1..8");
+     TORCH_CHECK(!(mcg && mul1), "mcg and mul1 are exclusive");
+-    TORCH_CHECK(size_n % FAT_TILE_N == 0 && a.size(1) % (FAT_TILE_K * FAT_K_SUB) == 0, "size_n % 128, size_k % 64");
++    TORCH_CHECK(size_n % FAT_TILE_N == 0 && a.size(1) % (FAT_TILE_K * FAT_G_KSUB) == 0, "size_n % 128, size_k % 32");
+     if (packed_ptrs.numel() == 0 || max_rows <= 0) return;
+     if (scatter)
+     {
+diff --git a/tests/gpu/bench_fat_grouped_shapes.py b/tests/gpu/bench_fat_grouped_shapes.py
+index b463abe..0782729 100644
+--- a/tests/gpu/bench_fat_grouped_shapes.py
++++ b/tests/gpu/bench_fat_grouped_shapes.py
+@@ -1,21 +1,27 @@
+-"""Grouped fat GEMM at serving-like fat-tier loads (run in the image): ~24 experts x 260-700 rows.
+-gate (6144->1536 K2, plain store), down (1536->6144 K2, atomic scatter), down plain store."""
+-import time
++"""Grouped fat GEMM at the live fat-tier loads (run in the image).
++
++Per TP2 rank of MiniMax-M3.1: hidden 6144, expert intermediate 1536. One 8192-token chunk routes
++top-4 over 128 experts (~256 rows each, skewed); the fat tier takes experts with more than 64 rows.
++gate|up 6144 -> 3072 (plain store) and down 1536 -> 6144 (atomic scatter), K2 and K3 (MUL1 codebook)."""
++import math
+ import torch
+ import vllm_exl3_c as nat
+ 
+ dev = "cuda"
+ torch.manual_seed(0)
+-counts = torch.randint(260, 700, (24,)).tolist()
++counts = (torch.randn(128) * 0.6 + math.log(210)).exp().round().clamp(1, 1000).long()
++counts = [c for c in counts.tolist() if c > 64]
+ rows = sum(counts)
+ starts = [0]
+ for n in counts:
+     starts.append(starts[-1] + n)
+ bounds = torch.tensor([b for g in range(len(counts)) for b in (starts[g], starts[g + 1])], dtype=torch.int32, device=dev)
+ el, eh = torch.empty(0, dtype=torch.long, device=dev), torch.empty(0, dtype=torch.float16, device=dev)
++tok = torch.cat([torch.randperm(8192, device=dev)[:n] for n in counts]).long()
++wt = torch.rand(rows, device=dev).half()
+ 
+ 
+-def setup(k_in, k_out, K):
++def experts(k_in, k_out, K):
+     tr = [torch.randint(-32768, 32767, (k_in // 16, k_out // 16, 16 * K), dtype=torch.int16, device=dev) for _ in counts]
+     sv = [(torch.rand(k_out, device=dev) + 0.5).half() for _ in counts]
+     return (torch.tensor([t.data_ptr() for t in tr], dtype=torch.int64, device=dev),
+@@ -23,25 +29,31 @@ def setup(k_in, k_out, K):
+ 
+ 
+ def timeit(fn, n=20):
+-    fn(); torch.cuda.synchronize(); t = time.perf_counter()
+-    for _ in range(n): fn()
+-    torch.cuda.synchronize(); return (time.perf_counter() - t) / n * 1e3
++    fn()
++    torch.cuda.synchronize()
++    t0, t1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    t0.record()
++    for _ in range(n):
++        fn()
++    t1.record()
++    torch.cuda.synchronize()
++    return t0.elapsed_time(t1) / n
+ 
+ 
+-g_tp, g_sp, *_keep_g = setup(6144, 1536, 2)
+-d_tp, d_sp, *_keep_d = setup(1536, 6144, 2)
++print(f"{len(counts)} experts, {rows} rows ({min(counts)}..{max(counts)})")
+ a_g = (torch.randn(rows, 6144, device=dev) * 0.5).half()
+ a_d = (torch.randn(rows, 1536, device=dev) * 0.5).half()
+-o_g = torch.empty(rows, 1536, dtype=torch.float32, device=dev)
+-o_dp = torch.empty(rows, 6144, dtype=torch.float32, device=dev)
+-o_ds = torch.zeros(8192, 6144, dtype=torch.float32, device=dev)
+-tok = torch.cat([torch.randperm(8192, device=dev)[:n] for n in counts]).long()
+-wt = torch.rand(rows, device=dev).half()
+-fl = 2 * rows * 6144 * 1536
+-for name, fn in (
+-    ("gate plain", lambda: nat.exl3_fat_gemm_grouped(a_g, g_tp, o_g, g_sp, bounds, el, eh, 2, False, True, False, 1536, max(counts))),
+-    ("down scatter", lambda: nat.exl3_fat_gemm_grouped(a_d, d_tp, o_ds, d_sp, bounds, tok, wt, 2, False, True, True, 6144, max(counts))),
+-    ("down plain", lambda: nat.exl3_fat_gemm_grouped(a_d, d_tp, o_dp, d_sp, bounds, el, eh, 2, False, True, False, 6144, max(counts))),
+-):
+-    ms = timeit(fn)
+-    print(f"{name:<13} {rows} rows / {len(counts)} experts: {ms:.2f} ms ({fl / ms / 1e9:.1f} TFLOPS)")
++o_g = torch.empty(rows, 3072, dtype=torch.float32, device=dev)
++o_d = torch.zeros(8192, 6144, dtype=torch.float32, device=dev)
++for K in (2, 3):
++    g_tp, g_sp, *_keep_g = experts(6144, 3072, K)
++    d_tp, d_sp, *_keep_d = experts(1536, 6144, K)
++    for name, fn, fl in (
++        (f"gate|up K{K} plain", lambda: nat.exl3_fat_gemm_grouped(
++            a_g, g_tp, o_g, g_sp, bounds, el, eh, K, False, True, False, 3072, max(counts)), 2 * rows * 6144 * 3072),
++        (f"down K{K} scatter", lambda: nat.exl3_fat_gemm_grouped(
++            a_d, d_tp, o_d, d_sp, bounds, tok, wt, K, False, True, True, 6144, max(counts)), 2 * rows * 1536 * 6144),
++    ):
++        ms = timeit(fn)
++        print(f"{name:<20} {ms:7.3f} ms ({fl / ms / 1e9:5.1f} TFLOPS)")
++    del g_tp, g_sp, _keep_g, d_tp, d_sp, _keep_d
+-- 
+2.51.0
+

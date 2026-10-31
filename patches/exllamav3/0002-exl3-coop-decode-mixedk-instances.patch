@@ -1,0 +1,725 @@
+From 5c57db75f99180811a1afe3964015f3c05206de7 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:46:08 -0500
+Subject: [PATCH 2/2] coop MoE decode: mixed-K instances, one launch per stage
+ for a mixed-K layer
+
+exl3_moe_coop_mk takes per-expert gate/up/down widths (int32 tables, each in
+[k_lo, k_hi]) and runs the whole layer in one rot/A/B launch set instead of one
+per (Kg, Ku, Kd) group. Kernels are templated on a width range [KLO, KHI]: the
+uniform instances are KLO == KHI (same code as before); mixed instances
+[1,2], [2,3], [3,4] read each item's width from the tables and dispatch the
+K-templated tile body per block (k_dispatch). Mixed instances are held to two
+blocks per SM (64 registers) and take the runs in descending expert order, so
+with experts numbered in ascending K the heavy items start first.
+
+The gate/up tail split now picks its factor from a wave-time model (a
+part-filled wave takes max(fill, 0.69) of a full one, a split 5% extra) instead
+of filling one wave exactly; it still only applies below three waves.
+
+GB10, MiniMax 2.15 pack TP2-rank layer types, live decode routing, L2 flushed,
+per-layer coop time, per-K-group launches (5e1e37de) -> one mixed-K launch:
+  112x(2,2,2)+16x(2,2,3) (45 layers): c=1 466 -> 436 us, c=4 978 -> 941 us
+  88x(2,2,2)+30x(2,2,3)+10x(3,3,3) (12 layers): c=1 529 -> 486 us, c=4 1112 -> 999 us
+A mixed instance on a uniform-K layer is bit-identical to the uniform launch;
+against the split launches the mixed-K layer differs only in the order slots
+are summed (rel 1e-4..6e-4). fp32-reference error 6.4e-4..6.6e-4 (split same,
+mixedk 6.4e-4..6.7e-4); robustness and counter-reuse checks vs mixedk <= 8.9e-4.
+---
+ exllamav3/exllamav3_ext/bindings.cpp          |   1 +
+ .../quant/comp_units/exl3_moe_coop_inst_k1.cu |   2 +-
+ .../quant/comp_units/exl3_moe_coop_inst_k2.cu |   2 +-
+ .../quant/comp_units/exl3_moe_coop_inst_k3.cu |   2 +-
+ .../quant/comp_units/exl3_moe_coop_inst_k4.cu |   2 +-
+ .../quant/comp_units/exl3_moe_coop_inst_k5.cu |   2 +-
+ .../quant/comp_units/exl3_moe_coop_inst_k6.cu |   2 +-
+ .../quant/comp_units/exl3_moe_coop_inst_k7.cu |   2 +-
+ .../quant/comp_units/exl3_moe_coop_inst_k8.cu |   2 +-
+ .../comp_units/exl3_moe_coop_inst_mk12.cu     |   4 +
+ .../comp_units/exl3_moe_coop_inst_mk23.cu     |   4 +
+ .../comp_units/exl3_moe_coop_inst_mk34.cu     |   4 +
+ .../comp_units/exl3_moe_coop_instances.cuh    |  70 ++++-----
+ .../exllamav3_ext/quant/exl3_moe_coop.cu      | 110 ++++++++++++--
+ .../exllamav3_ext/quant/exl3_moe_coop.cuh     |  43 ++++++
+ .../quant/exl3_moe_coop_kernel.cuh            | 134 +++++++++++++-----
+ 16 files changed, 301 insertions(+), 85 deletions(-)
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk12.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk23.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk34.cu
+
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index 8b401a33..a7fb4882 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -262,6 +262,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+     m.def("exl3_moe_mixedk", &exl3_moe_mixedk, "exl3_moe_mixedk");
+     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
++    m.def("exl3_moe_coop_mk", &exl3_moe_coop_mk, "exl3_moe_coop_mk");
+ 
+     m.def("bighead_attn", &bighead_attn, "bighead_attn");
+     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k1.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k1.cu
+index c2fd07f9..48011fdf 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k1.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k1.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(1)
++EXL3_MOE_COOP_INST_DEF(k1, 1, 1)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k2.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k2.cu
+index 8542dec7..99c3d0e8 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k2.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k2.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(2)
++EXL3_MOE_COOP_INST_DEF(k2, 2, 2)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k3.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k3.cu
+index 44a6e080..35f7ae77 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k3.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k3.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(3)
++EXL3_MOE_COOP_INST_DEF(k3, 3, 3)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k4.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k4.cu
+index 7f74461b..7db87a8f 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k4.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k4.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(4)
++EXL3_MOE_COOP_INST_DEF(k4, 4, 4)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k5.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k5.cu
+index 5afe7902..27e28052 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k5.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k5.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(5)
++EXL3_MOE_COOP_INST_DEF(k5, 5, 5)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k6.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k6.cu
+index 0b55beb5..bcd20019 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k6.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k6.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(6)
++EXL3_MOE_COOP_INST_DEF(k6, 6, 6)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k7.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k7.cu
+index 85927b8e..adeb5c65 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k7.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k7.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(7)
++EXL3_MOE_COOP_INST_DEF(k7, 7, 7)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k8.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k8.cu
+index dbf38c4d..30b0830a 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k8.cu
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_k8.cu
+@@ -1,4 +1,4 @@
+ #include "exl3_moe_coop_instances.cuh"
+ #include "../exl3_moe_coop_kernel.cuh"
+ 
+-EXL3_MOE_COOP_INST_DEF(8)
++EXL3_MOE_COOP_INST_DEF(k8, 8, 8)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk12.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk12.cu
+new file mode 100644
+index 00000000..dd196d89
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk12.cu
+@@ -0,0 +1,4 @@
++#include "exl3_moe_coop_instances.cuh"
++#include "../exl3_moe_coop_kernel.cuh"
++
++EXL3_MOE_COOP_INST_DEF(mk12, 1, 2)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk23.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk23.cu
+new file mode 100644
+index 00000000..d33705e7
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk23.cu
+@@ -0,0 +1,4 @@
++#include "exl3_moe_coop_instances.cuh"
++#include "../exl3_moe_coop_kernel.cuh"
++
++EXL3_MOE_COOP_INST_DEF(mk23, 2, 3)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk34.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk34.cu
+new file mode 100644
+index 00000000..3ef03a0e
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_inst_mk34.cu
+@@ -0,0 +1,4 @@
++#include "exl3_moe_coop_instances.cuh"
++#include "../exl3_moe_coop_kernel.cuh"
++
++EXL3_MOE_COOP_INST_DEF(mk34, 3, 4)
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh
+index f4aea440..ab909277 100644
+--- a/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_moe_coop_instances.cuh
+@@ -1,9 +1,10 @@
+ #pragma once
+ 
+-// Per-K compilation units of the fused decode MoE kernels (exl3_moe_coop_kernel.cuh): each
+-// exl3_moe_coop_inst_k{K}.cu instantiates the gate/up (A) and down (B) kernels for the three
+-// codebooks. Returns the kernel pointer for cudaLaunchKernel and the dynamic shared memory size
+-// (A: for the given Hi; B: fixed)
++// Compilation units of the fused decode MoE kernels (exl3_moe_coop_kernel.cuh): each
++// exl3_moe_coop_inst_k{K}.cu instantiates the gate/up (A) and down (B) kernels of width K for
++// the three codebooks, each exl3_moe_coop_inst_mk{LO}{HI}.cu the mixed-K ones whose experts take
++// any width in [LO, HI]. Returns the kernel pointer for cudaLaunchKernel and the dynamic shared
++// memory size (A: for the given Hi; B: fixed)
+ 
+ struct MoeCoopKernel
+ {
+@@ -11,54 +12,57 @@ struct MoeCoopKernel
+     int smem;
+ };
+ 
+-#define EXL3_MOE_COOP_INST_DECL(K) \
+-    MoeCoopKernel exl3_moe_coop_kernel_a_k##K(int cb, int Hi, bool wide); \
+-    MoeCoopKernel exl3_moe_coop_kernel_b_k##K(int cb, bool wide);
++#define EXL3_MOE_COOP_INST_DECL(NAME) \
++    MoeCoopKernel exl3_moe_coop_kernel_a_##NAME(int cb, int Hi, bool wide); \
++    MoeCoopKernel exl3_moe_coop_kernel_b_##NAME(int cb, bool wide);
+ 
+-EXL3_MOE_COOP_INST_DECL(1)
+-EXL3_MOE_COOP_INST_DECL(2)
+-EXL3_MOE_COOP_INST_DECL(3)
+-EXL3_MOE_COOP_INST_DECL(4)
+-EXL3_MOE_COOP_INST_DECL(5)
+-EXL3_MOE_COOP_INST_DECL(6)
+-EXL3_MOE_COOP_INST_DECL(7)
+-EXL3_MOE_COOP_INST_DECL(8)
++EXL3_MOE_COOP_INST_DECL(k1)
++EXL3_MOE_COOP_INST_DECL(k2)
++EXL3_MOE_COOP_INST_DECL(k3)
++EXL3_MOE_COOP_INST_DECL(k4)
++EXL3_MOE_COOP_INST_DECL(k5)
++EXL3_MOE_COOP_INST_DECL(k6)
++EXL3_MOE_COOP_INST_DECL(k7)
++EXL3_MOE_COOP_INST_DECL(k8)
++EXL3_MOE_COOP_INST_DECL(mk12)
++EXL3_MOE_COOP_INST_DECL(mk23)
++EXL3_MOE_COOP_INST_DECL(mk34)
+ 
+ #undef EXL3_MOE_COOP_INST_DECL
+ 
+-// Body of an instance file
+-#define EXL3_MOE_COOP_INST_DEF(K) \
+-    MoeCoopKernel exl3_moe_coop_kernel_a_k##K(int cb, int Hi, bool wide) \
++// Body of an instance file: kernels of width range [KLO, KHI]
++#define EXL3_MOE_COOP_INST_DEF(NAME, KLO, KHI) \
++    MoeCoopKernel exl3_moe_coop_kernel_a_##NAME(int cb, int Hi, bool wide) \
+     { \
+         using namespace exl3_moe_coop_ns; \
+-        const int smem = smem_a_bytes<K>(Hi); \
++        const int smem = smem_a_bytes<KLO, KHI>(Hi); \
+         if (wide) switch (cb) \
+         { \
+-            case 0: return { (void*) exl3_moe_coop_a_kernel<K, 0, true>, smem }; \
+-            case 1: return { (void*) exl3_moe_coop_a_kernel<K, 1, true>, smem }; \
+-            default: return { (void*) exl3_moe_coop_a_kernel<K, 2, true>, smem }; \
++            case 0: return { (void*) exl3_moe_coop_a_kernel<KLO, KHI, 0, true>, smem }; \
++            case 1: return { (void*) exl3_moe_coop_a_kernel<KLO, KHI, 1, true>, smem }; \
++            default: return { (void*) exl3_moe_coop_a_kernel<KLO, KHI, 2, true>, smem }; \
+         } \
+         switch (cb) \
+         { \
+-            case 0: return { (void*) exl3_moe_coop_a_kernel<K, 0, false>, smem }; \
+-            case 1: return { (void*) exl3_moe_coop_a_kernel<K, 1, false>, smem }; \
+-            default: return { (void*) exl3_moe_coop_a_kernel<K, 2, false>, smem }; \
++            case 0: return { (void*) exl3_moe_coop_a_kernel<KLO, KHI, 0, false>, smem }; \
++            case 1: return { (void*) exl3_moe_coop_a_kernel<KLO, KHI, 1, false>, smem }; \
++            default: return { (void*) exl3_moe_coop_a_kernel<KLO, KHI, 2, false>, smem }; \
+         } \
+     } \
+-    MoeCoopKernel exl3_moe_coop_kernel_b_k##K(int cb, bool wide) \
++    MoeCoopKernel exl3_moe_coop_kernel_b_##NAME(int cb, bool wide) \
+     { \
+         using namespace exl3_moe_coop_ns; \
+-        const int smem = smem_b_bytes<K>(); \
++        const int smem = smem_b_bytes<KLO, KHI>(); \
+         if (wide) switch (cb) \
+         { \
+-            case 0: return { (void*) exl3_moe_coop_b_kernel<K, 0, true>, smem }; \
+-            case 1: return { (void*) exl3_moe_coop_b_kernel<K, 1, true>, smem }; \
+-            default: return { (void*) exl3_moe_coop_b_kernel<K, 2, true>, smem }; \
++            case 0: return { (void*) exl3_moe_coop_b_kernel<KLO, KHI, 0, true>, smem }; \
++            case 1: return { (void*) exl3_moe_coop_b_kernel<KLO, KHI, 1, true>, smem }; \
++            default: return { (void*) exl3_moe_coop_b_kernel<KLO, KHI, 2, true>, smem }; \
+         } \
+         switch (cb) \
+         { \
+-            case 0: return { (void*) exl3_moe_coop_b_kernel<K, 0, false>, smem }; \
+-            case 1: return { (void*) exl3_moe_coop_b_kernel<K, 1, false>, smem }; \
+-            default: return { (void*) exl3_moe_coop_b_kernel<K, 2, false>, smem }; \
++            case 0: return { (void*) exl3_moe_coop_b_kernel<KLO, KHI, 0, false>, smem }; \
++            case 1: return { (void*) exl3_moe_coop_b_kernel<KLO, KHI, 1, false>, smem }; \
++            default: return { (void*) exl3_moe_coop_b_kernel<KLO, KHI, 2, false>, smem }; \
+         } \
+     }
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+index 35f00aae..e64e5b59 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+@@ -46,6 +46,27 @@ static MoeCoopKernel moe_coop_kernel_b(int K, int cb, bool wide)
+     }
+ }
+ 
++// Mixed-K instances cover [k_lo, k_lo + 1], k_lo 1..3 (exl3_moe_coop_mk checks the range)
++static MoeCoopKernel moe_coop_kernel_a_mk(int k_lo, int cb, int Hi, bool wide)
++{
++    switch (k_lo)
++    {
++        case 1: return exl3_moe_coop_kernel_a_mk12(cb, Hi, wide);
++        case 2: return exl3_moe_coop_kernel_a_mk23(cb, Hi, wide);
++        default: return exl3_moe_coop_kernel_a_mk34(cb, Hi, wide);
++    }
++}
++
++static MoeCoopKernel moe_coop_kernel_b_mk(int k_lo, int cb, bool wide)
++{
++    switch (k_lo)
++    {
++        case 1: return exl3_moe_coop_kernel_b_mk12(cb, wide);
++        case 2: return exl3_moe_coop_kernel_b_mk23(cb, wide);
++        default: return exl3_moe_coop_kernel_b_mk34(cb, wide);
++    }
++}
++
+ static int moe_coop_env(const char* name, int fallback)
+ {
+     const char* env = std::getenv(name);
+@@ -124,8 +145,8 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb,
+ 
+     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
+     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
+-    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
+-    MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
++    MoeCoopKernel ka = p.k_lo < p.k_hi ? moe_coop_kernel_a_mk(p.k_lo, cb, p.Hi, wide_a) : moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
++    MoeCoopKernel kb = p.k_lo < p.k_hi ? moe_coop_kernel_b_mk(p.k_lo, cb, wide_b) : moe_coop_kernel_b(K_d, cb, wide_b);
+     moe_coop_smem_optin(ka.kernel, ka.smem);
+     moe_coop_smem_optin(kb.kernel, kb.smem);
+ 
+@@ -310,6 +331,22 @@ void exl3_moe_coop_run
+     exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream);
+ }
+ 
++static void moe_coop_check_inputs(const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
++                                  const c10::optional<at::Tensor>& sh_out)
++{
++    TORCH_CHECK_DTYPE(x, kHalf);
++    TORCH_CHECK_DTYPE(sel, kLong);
++    TORCH_CHECK_DTYPE(rw, kHalf);
++    TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous(), "exl3_moe_coop: sel/rw must be contiguous");
++    TORCH_CHECK(sel.sizes() == rw.sizes() && sel.dim() == 2 && sel.size(0) == x.size(0), "exl3_moe_coop: sel/rw must be (bsz, topk)");
++    if (sh_out)
++    {
++        TORCH_CHECK_DTYPE(sh_out.value(), kFloat);
++        TORCH_CHECK(sh_out->is_contiguous() && sh_out->size(-1) == x.size(1) && sh_out->numel() >= x.size(0) * x.size(1),
++                    "exl3_moe_coop: shared expert output shape");
++    }
++}
++
+ void exl3_moe_coop
+ (
+     const at::Tensor& x,
+@@ -341,22 +378,71 @@ void exl3_moe_coop
+     const c10::optional<at::Tensor>& sh_gate_w
+ )
+ {
+-    TORCH_CHECK_DTYPE(x, kHalf);
+-    TORCH_CHECK_DTYPE(sel, kLong);
+-    TORCH_CHECK_DTYPE(rw, kHalf);
+-    TORCH_CHECK(sel.is_contiguous() && rw.is_contiguous(), "exl3_moe_coop: sel/rw must be contiguous");
+-    TORCH_CHECK(sel.sizes() == rw.sizes() && sel.dim() == 2 && sel.size(0) == x.size(0), "exl3_moe_coop: sel/rw must be (bsz, topk)");
+-    if (sh_out)
++    moe_coop_check_inputs(x, sel, rw, sh_out);
++    int K_gu, K_d, cb;
++    MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
++                                            g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated,
++                                            had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);
++    p.min_expert = min_expert;
++    p.max_expert = max_expert;
++    exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, sh_out);
++}
++
++void exl3_moe_coop_mk
++(
++    const at::Tensor& x,
++    const at::Tensor& sel,
++    const at::Tensor& rw,
++    int min_expert,
++    int max_expert,
++    int Hi,
++    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
++    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
++    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
++    const c10::optional<at::Tensor>& g_bias,
++    const c10::optional<at::Tensor>& u_bias,
++    const c10::optional<at::Tensor>& d_bias,
++    const at::Tensor& k_gate, const at::Tensor& k_up, const at::Tensor& k_down,
++    int k_lo, int k_hi,
++    bool mcg, bool mul1,
++    int act,
++    float act_limit,
++    bool gated,
++    at::Tensor& had_g,
++    at::Tensor& had_u,
++    at::Tensor& gu_g,
++    at::Tensor& gu_u,
++    at::Tensor& act_out,
++    at::Tensor& d_out,
++    at::Tensor& ctr,
++    at::Tensor& out,
++    const c10::optional<at::Tensor>& sh_out,
++    const c10::optional<at::Tensor>& sh_gate_w
++)
++{
++    moe_coop_check_inputs(x, sel, rw, sh_out);
++    TORCH_CHECK(k_lo >= 1 && k_hi <= 8 && k_lo <= k_hi, "exl3_moe_coop_mk: K range");
++    TORCH_CHECK(k_lo == k_hi || (k_hi == k_lo + 1 && k_lo <= 3), "exl3_moe_coop_mk: mixed-K instances cover [K, K + 1] for K 1..3");
++    for (const at::Tensor* t : { &k_gate, &k_up, &k_down })
+     {
+-        TORCH_CHECK_DTYPE(sh_out.value(), kFloat);
+-        TORCH_CHECK(sh_out->is_contiguous() && sh_out->size(-1) == x.size(1) && sh_out->numel() >= x.size(0) * x.size(1),
+-                    "exl3_moe_coop: shared expert output shape");
++        TORCH_CHECK_DTYPE(*t, kInt);
++        TORCH_CHECK(t->is_contiguous() && t->numel() >= u_trellis.size(0), "exl3_moe_coop_mk: K tables must be contiguous int32, one per expert");
+     }
+     int K_gu, K_d, cb;
+     MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
+-                                            g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated,
++                                            g_bias, u_bias, d_bias, k_lo, k_lo, k_lo, mcg, mul1, act, act_limit, gated,
+                                             had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);
+     p.min_expert = min_expert;
+     p.max_expert = max_expert;
++    if (k_lo < k_hi)
++    {
++        // Every expert's widths must lie in [k_lo, k_hi] (the caller's contract; not checked
++        // on the device, which would cost a sync)
++        p.k_gate = (const int*) (gated ? k_gate : k_up).data_ptr();
++        p.k_up = (const int*) k_up.data_ptr();
++        p.k_down = (const int*) k_down.data_ptr();
++        p.k_lo = k_lo;
++        p.k_hi = k_hi;
++    }
+     exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, sh_out);
+ }
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+index c6ebfea5..adb1fd2d 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+@@ -42,6 +42,14 @@ struct MoeCoopParams
+     const int64_t* g_bias;      // nullable
+     const int64_t* u_bias;
+     const int64_t* d_bias;
++    // Mixed-K layers (k_lo < k_hi): per-expert widths (int32 device arrays indexed by local
++    // expert, each in [k_lo, k_hi]), one launch per stage for the whole layer. Uniform layers:
++    // k_lo = k_hi = 0 and null tables (the launch's K_gu / K_d apply)
++    const int* k_gate;
++    const int* k_up;
++    const int* k_down;
++    int k_lo;
++    int k_hi;
+     int act;                    // MOE_COOP_ACT_*
+     float act_limit;
+     bool gated;                 // false: no gate projection, activation is relu(u) * u
+@@ -155,6 +163,41 @@ void exl3_moe_coop
+     const c10::optional<at::Tensor>& sh_gate_w
+ );
+ 
++// Mixed-K tensor front end: per-expert widths k_gate / k_up / k_down (int32, one per expert of
++// the tables, each in [k_lo, k_hi]; k_hi <= k_lo + 1, k_lo <= 3 unless uniform), the whole layer
++// in one launch per stage. Otherwise as exl3_moe_coop
++void exl3_moe_coop_mk
++(
++    const at::Tensor& x,
++    const at::Tensor& sel,
++    const at::Tensor& rw,
++    int min_expert,
++    int max_expert,
++    int Hi,
++    const at::Tensor& g_trellis, const at::Tensor& g_suh, const at::Tensor& g_svh,
++    const at::Tensor& u_trellis, const at::Tensor& u_suh, const at::Tensor& u_svh,
++    const at::Tensor& d_trellis, const at::Tensor& d_suh, const at::Tensor& d_svh,
++    const c10::optional<at::Tensor>& g_bias,
++    const c10::optional<at::Tensor>& u_bias,
++    const c10::optional<at::Tensor>& d_bias,
++    const at::Tensor& k_gate, const at::Tensor& k_up, const at::Tensor& k_down,
++    int k_lo, int k_hi,
++    bool mcg, bool mul1,
++    int act,
++    float act_limit,
++    bool gated,
++    at::Tensor& had_g,
++    at::Tensor& had_u,
++    at::Tensor& gu_g,
++    at::Tensor& gu_u,
++    at::Tensor& act_out,
++    at::Tensor& d_out,
++    at::Tensor& ctr,
++    at::Tensor& out,
++    const c10::optional<at::Tensor>& sh_out,
++    const c10::optional<at::Tensor>& sh_gate_w
++);
++
+ // Length of the int32 scratch for a module: completion counters + run table (slots_max =
+ // MAX_BSZN * top_k)
+ inline int64_t exl3_moe_coop_ctr_len(int64_t slots_max, int64_t bsz_max, int64_t I, int64_t Ho)
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+index d872bfe9..18288fc0 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+@@ -68,22 +68,49 @@ constexpr bool tile_reg() { return bits == 2 || bits == 3 || bits == 4; }
+ template <int bits>
+ constexpr bool tile_may_stage() { return !(bits == 2 || bits == 4); }
+ 
++// Kernels are instantiated for a width range [KLO, KHI]: KLO == KHI is the uniform-K kernel of
++// one launch per K; a mixed-K instance reads each expert's width from p.k_gate / k_up / k_down
++// and runs the matching tile body (k_dispatch), so a mixed-K layer is one launch per stage
++template <int KLO, int KHI>
++constexpr bool range_may_stage()
++{
++    if constexpr (KLO < KHI) return tile_may_stage<KLO>() || range_may_stage<KLO + 1, KHI>();
++    else return tile_may_stage<KLO>();
++}
++
+ // Blocks per SM the register budget is held to (0: the compiler's choice). Two 512-thread blocks
+ // (64 registers) is what the bandwidth-bound decode wants; the 3 bpw body needs the bound to get
+ // there (78 registers without), the 1/2/4 bpw ones land at <= 64 on their own (forcing it costs
+-// the 2 bpw body ~2%)
+-template <int bits>
+-constexpr int tile_min_blocks() { return bits == 3 ? 2 : 0; }
++// the 2 bpw body ~2%). A mixed-K kernel holds every body of its range, so it takes the bound
++template <int KLO, int KHI>
++constexpr int tile_min_blocks()
++{
++    return KHI > 4 ? 0 : (KLO < KHI || KLO == 3) ? 2 : 0;
++}
++
++template <int V> struct KConst { static constexpr int value = V; };
++
++// Calls f(KConst<k>{}) for the runtime width k in [K, KHI] (block-uniform)
++template <int K, int KHI, typename F>
++__device__ __forceinline__ void k_dispatch(int k, F f)
++{
++    if constexpr (K < KHI)
++    {
++        if (k == K) f(KConst<K>{});
++        else k_dispatch<K + 1, KHI>(k, f);
++    }
++    else f(KConst<K>{});
++}
+ 
+ // Dynamic shared memory layout (bytes)
+-template <int bits>
+-__host__ __device__ constexpr int smem_stage_bytes() { return tile_may_stage<bits>() ? WK * STAGE_WORDS * 4 : 0; }
++template <int KLO, int KHI>
++__host__ __device__ constexpr int smem_stage_bytes() { return range_may_stage<KLO, KHI>() ? WK * STAGE_WORDS * 4 : 0; }
+ constexpr int smem_red_bytes() { return WK * ROWS * COLS * 4; }   // same for both geometries: wk x ROWS x cols
+ constexpr int smem_part_bytes() { return WK * 128 * 4; }
+-template <int bits>
+-__host__ __device__ constexpr int smem_a_bytes(int Hi) { return Hi * 2 + smem_red_bytes() + smem_stage_bytes<bits>(); }
+-template <int bits>
+-__host__ __device__ constexpr int smem_b_bytes() { return smem_red_bytes() + smem_stage_bytes<bits>() + smem_part_bytes(); }
++template <int KLO, int KHI>
++__host__ __device__ constexpr int smem_a_bytes(int Hi) { return Hi * 2 + smem_red_bytes() + smem_stage_bytes<KLO, KHI>(); }
++template <int KLO, int KHI>
++__host__ __device__ constexpr int smem_b_bytes() { return smem_red_bytes() + smem_stage_bytes<KLO, KHI>() + smem_part_bytes(); }
+ 
+ // ---------------------------------------------------------------------------------------------
+ // Elementwise helpers (fp32 forms of activation_kernels.cuh, which can't be included twice)
+@@ -399,12 +426,17 @@ __device__ __forceinline__ int pick_ksplit(int forced, int items, int cap, int s
+ 
+ // Gate/up stage: the items filling whole waves run unsplit (blocks 0..n_full-1 = items, as
+ // without a split); the rest, the last partial wave that a few blocks would otherwise drain
+-// alone, split cap / n_tail ways so they fill one wave together (block n_full + q * n_tail + j =
+-// split q of item n_full + j). Only for launches of up to three waves: past that the tail is a
+-// small share and the split measured a net loss. align consecutive items (one (slot, chunk)
+-// arrival group) share a factor. forced > 0 splits every item that many ways. Blocks past the
+-// split items get an item index past the end. Returns the launch's split factor (1: nothing
+-// split)
++// alone, split s ways (block n_full + q * n_tail + j = split q of item n_full + j). s minimizes
++// the tail's modeled time: its n_tail * s pieces of 1/s item run in waves of cap, a wave filled
++// to f taking max(f, TAIL_FILL) of a full one (a part-filled wave's blocks stream faster, up to
++// the per-block limit; 0.69 measured on GB10), a split 5% more for its extra block start-ups and
++// partials. Only for launches of up to three waves: past that, blocks retire staggered, the
++// tail is a small share and splitting it measured a net loss. align consecutive items (one
++// (slot, chunk) arrival group) share a factor. forced > 0 splits every item that many ways.
++// Blocks past the split items get an item index past the end. Returns the launch's split factor
++// (1: nothing split)
++constexpr float TAIL_FILL = 0.69f;
++
+ __device__ __forceinline__ int split_item(int forced, int items, int cap, int smax, int align, int& item, int& ks, int& ksplit)
+ {
+     const int b = blockIdx.x;
+@@ -415,10 +447,25 @@ __device__ __forceinline__ int split_item(int forced, int items, int cap, int sm
+         n_full -= n_full % align;
+     }
+     const int n_tail = items - n_full;
+-    const int s = n_tail == 0 ? 1
+-                : forced > 0 ? forced
+-                : items >= 3 * cap ? 1
+-                : max(1, min(min(smax, cap / n_tail), ((int) gridDim.x - n_full) / n_tail));
++    int s = 1;
++    if (forced > 0) s = n_tail > 0 ? forced : 1;
++    else if (n_tail > 0 && items < 3 * cap)
++    {
++        smax = min(smax, ((int) gridDim.x - n_full) / n_tail);
++        float best = 2.0f;
++        for (int si = 1; si <= smax; ++si)
++        {
++            const int pieces = n_tail * si;
++            const int r = pieces % cap;
++            const float waves = (float) (pieces / cap) + (r ? fmaxf((float) r / cap, TAIL_FILL) : 0.0f);
++            const float t = waves / si * (si > 1 ? 1.05f : 1.0f);
++            if (t < best - 1e-4f)
++            {
++                best = t;
++                s = si;
++            }
++        }
++    }
+     if (b < n_full || s == 1)
+     {
+         item = b;
+@@ -433,6 +480,16 @@ __device__ __forceinline__ int split_item(int forced, int items, int cap, int sm
+     return s;
+ }
+ 
++// Run of a block's item. Mixed-K launches take the runs in descending expert order: callers
++// number a mixed-K layer's experts in ascending K, so the heavy items start first and the light
++// ones fill the launch's last wave (the order of items is numerically neutral)
++template <int KLO, int KHI>
++__device__ __forceinline__ int run_order(int r, int n_runs)
++{
++    if constexpr (KLO < KHI) return r < n_runs ? n_runs - 1 - r : r;
++    else return r;
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // GEMV tile: one 32-column group of an (nrows, k) x (k, n) product, the rows being the run's slots
+ // (row r reads A at A2 + rows[r] * a_stride2 half2 and writes C at rows[r] * c_stride), the whole
+@@ -806,8 +863,8 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
+ // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
+ // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
+ 
+-template <int bits, int cb, bool WIDE>
+-__global__ __launch_bounds__(THREADS, tile_min_blocks<bits>())
++template <int KLO, int KHI, int cb, bool WIDE>
++__global__ __launch_bounds__(THREADS, tile_min_blocks<KLO, KHI>())
+ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ {
+     constexpr int TCOLS = tile_cols<WIDE>();
+@@ -840,7 +897,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ 
+     const bool is_gate = p.gated && (item % nproj) == 0;
+     const int rem2 = item / nproj;
+-    const int run_idx = rem2 / ng;
++    const int run_idx = run_order<KLO, KHI>(rem2 / ng, n_runs);
+     const int group = rem2 % ng;
+     int nrows = 0, local = 0;
+     if (!read_run(p, run_idx, n_runs, sh_rows, nrows, local))
+@@ -858,14 +915,19 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+     const int k_end = kslices_all * (ks + 1) / ksplit;
+ 
+     const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];
++    // Width of this item: the instance's, or the expert's (mixed-K instance)
++    const int kbits = KLO == KHI ? KLO : (is_gate ? p.k_gate : p.k_up)[local];
+     // Partial output rows of split ks live at slot + ks * slots (ksplit * slots rows fit)
+     const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (part_f32 ? 4 : 2);
+     void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
+     if (p.a_global)
+     {
+         const half2* A2 = (const half2*) (is_gate ? p.had_g : p.had_u);
+-        gemv_tile<bits, cb, WIDE>(B32, A2, (size_t) p.Hi / 2, sh_rows, nrows, C, p.I, part_f32, k_begin, k_end,
+-                                  p.I / 16, group, sh_red, sh_stage, [] {});
++        k_dispatch<KLO, KHI>(kbits, [&] (auto kc)
++        {
++            gemv_tile<decltype(kc)::value, cb, WIDE>(B32, A2, (size_t) p.Hi / 2, sh_rows, nrows, C, p.I, part_f32,
++                                                     k_begin, k_end, p.I / 16, group, sh_red, sh_stage, [] {});
++        });
+     }
+     else
+     {
+@@ -879,8 +941,11 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+             for (int c = k_begin / 8 + warp; c < CEIL_DIVIDE(k_end, 8); c += WK)
+                 rotate_chunk(p, 0, suh, c, sh_A, lane);
+         };
+-        gemv_tile<bits, cb, WIDE>(B32, (const half2*) sh_A, 0, sh_rows, nrows, C, p.I, part_f32, k_begin, k_end,
+-                                  p.I / 16, group, sh_red, sh_stage, rotate);
++        k_dispatch<KLO, KHI>(kbits, [&] (auto kc)
++        {
++            gemv_tile<decltype(kc)::value, cb, WIDE>(B32, (const half2*) sh_A, 0, sh_rows, nrows, C, p.I, part_f32,
++                                                     k_begin, k_end, p.I / 16, group, sh_red, sh_stage, rotate);
++        });
+     }
+ 
+     for (int r = 0; r < nrows; ++r)
+@@ -941,8 +1006,8 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ // token's slots (rotation * svh, down bias, routing weight) in a fixed order, merges the shared
+ // expert and stores the trimmed row
+ 
+-template <int bits, int cb, bool WIDE>
+-__global__ __launch_bounds__(THREADS, tile_min_blocks<bits>())
++template <int KLO, int KHI, int cb, bool WIDE>
++__global__ __launch_bounds__(THREADS, tile_min_blocks<KLO, KHI>())
+ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+ {
+     constexpr int TCOLS = tile_cols<WIDE>();
+@@ -951,7 +1016,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+     extern __shared__ uint32_t smem_dyn[];
+     float* sh_red = (float*) smem_dyn;
+     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
+-    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits>() ? WK * STAGE_WORDS : 0));
++    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (range_may_stage<KLO, KHI>() ? WK * STAGE_WORDS : 0));
+     __shared__ int sh_flag;
+     __shared__ int sh_n_active;
+     __shared__ float sh_gate;
+@@ -970,7 +1035,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+     const int item = blockIdx.x;
+     const int ks = item % ksplit;
+     const int rem = item / ksplit;
+-    const int run_idx = rem / ng;
++    const int run_idx = run_order<KLO, KHI>(rem / ng, n_runs);
+     const int group = rem % ng;
+     int nrows = 0, local = 0;
+     if (!read_run(p, run_idx, n_runs, sh_rows, nrows, local)) return;
+@@ -980,9 +1045,14 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+ 
+     {
+         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
++        const int kbits = KLO == KHI ? KLO : p.k_down[local];
+         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
+-        gemv_tile<bits, cb, WIDE>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, [] {});
++        k_dispatch<KLO, KHI>(kbits, [&] (auto kc)
++        {
++            gemv_tile<decltype(kc)::value, cb, WIDE>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C,
++                                                     p.Ho, true, k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage,
++                                                     [] {});
++        });
+     }
+ 
+     for (int r = 0; r < nrows; ++r)
+-- 
+2.51.0
+

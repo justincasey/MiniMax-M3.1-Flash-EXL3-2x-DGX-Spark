@@ -1,0 +1,708 @@
+From 5e1e37de656effe29fa7ce5ce00dccbed1cb6f5e Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:15:13 -0500
+Subject: [PATCH 1/2] coop MoE decode: unpredicated slice loop, early weight
+ prefetch, device-side split-k
+
+Slice loop (bit-identical): A fragments run AD=2 slices ahead in a ring like the
+weights; weight and A fetch pointers advance and clamp at the last slice so every
+fetch is unconditional (no predicated loads, no ring MOVs, no local-memory stack);
+lanes past the run's rows read its last row and the MMA's upper 8 rows are left
+undefined (rows are independent, only rows < nrows reach sh_red) instead of
+re-zeroed each slice; the 3 bpw path's idle lanes read lane 23's word.
+
+Block start: the run table packs each run's local expert above its start, so a
+block reaches its weights' pointer table after one dependent load; gemv_tile
+issues the weight prefetch before the caller's remaining setup (bsz-1 input
+rotation, now only the chunks of the split's k range) and the rows barrier.
+
+Split-k chosen per launch on the device from the run count (the host-sized grid
+can't see the routing): the gate/up stage splits the items of a launch's last,
+part-filled wave so they fill one wave (launches of up to three waves; split
+partials fp32 for the whole launch), the down stage splits a launch whose items
+don't fill one wave. EXL3_MOE_COOP_DSPLIT caps it (1 disables), EXL3_MOE_COOP_KSPLIT
+still forces a static split. The 3 bpw kernels are held to two blocks per SM.
+
+GB10, TP2-rank MiniMax geometry (6144/1536, 128 experts, top-4, mixed-K split
+112xK2 / 16xK3 down), L2 flushed, per-layer coop kernel time:
+  live c=1 routing (4 rows):  445 -> 414 us (169 -> 182 GB/s)
+  live c=4 routing (16 rows): 1045 -> 1010 us
+  16 distinct experts, 4 rows: 608 -> 593 us (bit-identical)
+Unsplit launches are bit-identical; split ones stay within the coop tests'
+tolerances (bench_moe_coop_split: vs mixedk <= 9.1e-4, vs fp32 ref 6.4e-4).
+---
+ .../exllamav3_ext/quant/exl3_moe_coop.cu      |  61 +++-
+ .../exllamav3_ext/quant/exl3_moe_coop.cuh     |  10 +-
+ .../quant/exl3_moe_coop_kernel.cuh            | 339 ++++++++++++------
+ 3 files changed, 289 insertions(+), 121 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+index 505355e7..35f00aae 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+@@ -46,17 +46,40 @@ static MoeCoopKernel moe_coop_kernel_b(int K, int cb, bool wide)
+     }
+ }
+ 
+-// Split-k factor: blocks per column chunk, partial outputs summed by the last-arriving block.
+-// Measured ineffective.
+-static int moe_coop_pick_ksplit(int max_split)
++static int moe_coop_env(const char* name, int fallback)
+ {
+-    static int forced = -2;
+-    if (forced == -2)
+-    {
+-        const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT");
+-        forced = env ? atoi(env) : 0;
+-    }
+-    return forced > 0 ? std::min(forced, max_split) : 1;
++    const char* env = std::getenv(name);
++    return env ? atoi(env) : fallback;
++}
++
++// Split-k: blocks per (run, group[, projection]) item, partial outputs summed by the last
++// arrival. EXL3_MOE_COOP_KSPLIT = n forces n on every item of every launch (grid sized for it; a
++// static split measured ineffective). Otherwise the kernels split per launch from the
++// device-side run count where whole waves of resident blocks would go part empty (split_item,
++// pick_ksplit), at most EXL3_MOE_COOP_DSPLIT ways (default 8, 1 disables)
++static int moe_coop_forced_ksplit()
++{
++    static int forced = moe_coop_env("EXL3_MOE_COOP_KSPLIT", 0);
++    return forced;
++}
++
++static int moe_coop_dsplit_max()
++{
++    static int dsplit = std::max(1, moe_coop_env("EXL3_MOE_COOP_DSPLIT", 8));
++    return dsplit;
++}
++
++// Blocks of a kernel resident at once on the device (occupancy x SMs), once per (kernel, smem)
++static int moe_coop_resident(void* kernel, int smem, int device)
++{
++    static std::map<std::pair<void*, int>, int> done;
++    auto key = std::make_pair(kernel, smem);
++    auto it = done.find(key);
++    if (it != done.end()) return it->second;
++    int per_sm = 0, sms = 0;
++    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, MOE_COOP_THREADS, smem));
++    cuda_check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
++    return done[key] = std::max(1, per_sm * sms);
+ }
+ 
+ // Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
+@@ -108,11 +131,19 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb,
+ 
+     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
+     const int base_b = slots * (p.Ho / (wide_b ? 128 : MOE_COOP_COLS));
+-    const int max_split = std::max(1, p.slots_max / slots);
+-    p.ksplit_a = moe_coop_pick_ksplit(max_split);
+-    p.ksplit_b = moe_coop_pick_ksplit(max_split);
+-    const int grid_a = base_a * p.ksplit_a;
+-    const int grid_b = base_b * p.ksplit_b;
++    // Split partials: d_out rows (fp32) at slot + q * slots; A's in the gate/up scratch as fp32,
++    // which a half scratch holds half as many rows of
++    const int max_split_a = std::max(1, (p.gu_f32 ? p.slots_max : p.slots_max / 2) / slots);
++    const int max_split_b = std::max(1, p.slots_max / slots);
++    const int forced = moe_coop_forced_ksplit();
++    p.ksplit_a = forced > 0 ? std::min(forced, max_split_a) : 0;
++    p.ksplit_b = forced > 0 ? std::min(forced, max_split_b) : 0;
++    p.split_max_a = std::min(max_split_a, moe_coop_dsplit_max());
++    p.split_max_b = std::min(max_split_b, moe_coop_dsplit_max());
++    p.cap_a = moe_coop_resident(ka.kernel, ka.smem, device);
++    p.cap_b = moe_coop_resident(kb.kernel, kb.smem, device);
++    const int grid_a = base_a * std::max(1, p.ksplit_a);
++    const int grid_b = base_b * std::max(1, p.ksplit_b);
+ 
+     void* args[] = { (void*) &p };
+     if (p.a_global)
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+index 69e5856b..c6ebfea5 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+@@ -59,10 +59,14 @@ struct MoeCoopParams
+     int* ctr_b;                 // (MAX_BSZN, Ho / 128) completion counters of the down stage
+     int ctr_a_len;
+     int ctr_b_len;
+-    int ksplit_a;               // split-k blocks per chunk per stage (launcher; partial rows at slot + q * slots)
+-    int ksplit_b;
++    int ksplit_a;               // forced split-k blocks per item per stage (EXL3_MOE_COOP_KSPLIT), 0: picked on
++    int ksplit_b;               //   the device from the run count (partial rows at slot + q * slots)
++    int split_max_a;            // largest split the scratch holds (A partials are fp32 when split)
++    int split_max_b;
++    int cap_a;                  // resident blocks of the launch's kernel (occupancy x SMs)
++    int cap_b;
+     int dbg;                    // diagnostics (EXL3_MOE_COOP_DBG): 1 skip A epilogue, 2 skip B reduction
+-    int* runs;                  // run table (bsz > 1): [n_runs, -, run_start[slots_max + 1], order[slots_max]]
++    int* runs;                  // run table (bsz > 1): [n_runs, -, run_start[slots_max + 1] (rank | local expert << 16), order[slots_max]]
+     int slots_max;
+     int rows_max;               // token rows the output scratch holds
+     int n_local;                // entries in the pointer tables
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+index ae4dd192..d872bfe9 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+@@ -19,7 +19,10 @@
+ //                 a fixed order, merges the shared expert and stores the trimmed row.
+ //
+ // The grid is sized for the no-duplicates case (slots x groups x projections); blocks past the
+-// actual run count exit at once.
++// actual run count exit at once. Where whole waves of resident blocks would go part empty (a
++// launch covering one K group of a mixed-K layer often holds one or two experts; a short launch
++// ends on a part-filled wave), blocks split items' k ranges instead (split_item, pick_ksplit) and
++// the last arrival sums the partials.
+ 
+ #include <cuda_fp16.h>
+ #include "../util.h"
+@@ -32,8 +35,10 @@
+ namespace exl3_moe_coop_ns {
+ 
+ constexpr int WK = 16;                          // k-split (warps per block)
++constexpr int AD = 2;                           // A-fragment prefetch distance (divides PF)
+ constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
+ constexpr int PF = 4;                           // prefetch ring depth
++static_assert(PF % AD == 0, "A-fragment ring index must be static in the unrolled slice loop");
+ constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
+ constexpr int THREADS = WK * 32;
+ constexpr int COLS = WNT * 16;                  // columns per warp
+@@ -63,6 +68,13 @@ constexpr bool tile_reg() { return bits == 2 || bits == 3 || bits == 4; }
+ template <int bits>
+ constexpr bool tile_may_stage() { return !(bits == 2 || bits == 4); }
+ 
++// Blocks per SM the register budget is held to (0: the compiler's choice). Two 512-thread blocks
++// (64 registers) is what the bandwidth-bound decode wants; the 3 bpw body needs the bound to get
++// there (78 registers without), the 1/2/4 bpw ones land at <= 64 on their own (forcing it costs
++// the 2 bpw body ~2%)
++template <int bits>
++constexpr int tile_min_blocks() { return bits == 3 ? 2 : 0; }
++
+ // Dynamic shared memory layout (bytes)
+ template <int bits>
+ __host__ __device__ constexpr int smem_stage_bytes() { return tile_may_stage<bits>() ? WK * STAGE_WORDS * 4 : 0; }
+@@ -145,6 +157,16 @@ __device__ __forceinline__ void had128(float& v0, float& v1, float& v2, float& v
+     v3 = h3 * R_SCALE;
+ }
+ 
++// A register of unspecified content (no instruction): MMA operand rows whose results are discarded
++__device__ __forceinline__ half2 undef_h2()
++{
++    uint32_t u;
++    asm volatile("" : "=r"(u));
++    half2 h;
++    *reinterpret_cast<uint32_t*>(&h) = u;
++    return h;
++}
++
+ __device__ __forceinline__ void unpack_h4(uint2 u, float& v0, float& v1, float& v2, float& v3)
+ {
+     half2 a = *reinterpret_cast<half2*>(&u.x);
+@@ -224,7 +246,8 @@ __device__ __forceinline__ SlotInfo slot_info(const MoeCoopParams& p, int s)
+ // ---------------------------------------------------------------------------------------------
+ // Slot grouping (bsz > 1): active slots sorted by (local expert, slot) and cut into runs of at
+ // most ROWS slots of one expert. Built once per call by block 0 of the rotation kernel into the
+-// run table (p.runs: [n_runs, -, run_start[0..], order[0..]]), read by every block of A and B.
++// run table (p.runs: [n_runs, -, run_start[0..] (rank | local expert << 16), order[0..]]), read
++// by every block of A and B.
+ // At bsz 1 top-k picks are distinct, so runs are the slots themselves and no table is built
+ 
+ __device__ __forceinline__ void build_runs
+@@ -268,9 +291,10 @@ __device__ __forceinline__ void build_runs
+     // Run starts: a new expert, or ROWS slots into the same expert (first index of an expert =
+     // number of active slots with a smaller expert)
+     int is_start = 0;
++    int e_t = 0;
+     if (t < n_active)
+     {
+-        const int e_t = sh_local[sh_order[t]];
++        e_t = sh_local[sh_order[t]];
+         int first = 0;
+         for (int u = 0; u < slots; ++u)
+         {
+@@ -297,7 +321,7 @@ __device__ __forceinline__ void build_runs
+         total_runs += sh_scan[w];
+     }
+     const int run_id = base + v - is_start;
+-    if (is_start) run_start[run_id] = t;
++    if (is_start) run_start[run_id] = t | (e_t << 16);     // run's expert packed above its start
+     if (t == 0)
+     {
+         run_start[total_runs] = n_active;
+@@ -305,44 +329,125 @@ __device__ __forceinline__ void build_runs
+     }
+ }
+ 
+-// The block's run: its slot indices into rows[] (shared) and the row count; false past the end
+-__device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, int* rows, int& nrows, int* sh_res)
++// Runs of this call. bsz 1: the active slots, each its own run (top-k picks are distinct)
++__device__ __forceinline__ int run_count(const MoeCoopParams& p)
+ {
++    if (p.a_global) return p.runs[0];
++    int n = 0;
++    for (int s = 0; s < p.bsz * p.topk; ++s)
++        n += slot_info(p, s).active ? 1 : 0;
++    return n;
++}
++
++// The block's run: its local expert and row count, false past the end. The first nrows threads
++// store the run's slot indices into rows[] (shared), visible after the caller's next barrier.
++// One dependent load (run_start, which carries the expert) ahead of the weights' pointer table
++__device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, int n_runs, int* rows, int& nrows, int& local)
++{
++    if (run_idx >= n_runs) return false;
+     if (!p.a_global)
+     {
+-        // bsz 1: run = slot (an inactive slot returns false; kernel A checks for empty rows)
+-        if (run_idx >= p.bsz * p.topk) return false;
+-        const SlotInfo si = slot_info(p, run_idx);
+-        if (!si.active) return false;
+-        if (threadIdx.x == 0) rows[0] = run_idx;
++        // bsz 1: run k = the k-th active slot
++        int k = run_idx;
++        int slot = -1;
++        for (int s = 0; s < p.bsz * p.topk && slot < 0; ++s)
++        {
++            const SlotInfo si = slot_info(p, s);
++            if (si.active && k-- == 0)
++            {
++                slot = s;
++                local = si.local;
++            }
++        }
++        if (threadIdx.x == 0) rows[0] = slot;
+         nrows = 1;
+-        __syncthreads();
+         return true;
+     }
+-    const int n_runs = p.runs[0];
+-    if (run_idx >= n_runs) return false;
+-    const int start = p.runs[2 + run_idx];
+-    const int end = p.runs[2 + run_idx + 1];
+-    nrows = end - start;
++    const int s0 = p.runs[2 + run_idx];
++    const int s1 = p.runs[2 + run_idx + 1];
++    const int start = s0 & 0xffff;
++    local = s0 >> 16;
++    nrows = (s1 & 0xffff) - start;
+     if (threadIdx.x < nrows) rows[threadIdx.x] = p.runs[2 + p.slots_max + 1 + start + threadIdx.x];
+-    __syncthreads();
+     return true;
+ }
+ 
++// Split-k: a block covers part of an item's k range, the partial outputs summed by the item's
++// last arrival. Chosen per launch on the device from the run count (the grid is sized on the host
++// for the no-duplicates case and can't see the routing); cap = resident blocks of the launch.
++//
++// Down stage: the whole launch splits by the factor minimizing waves per item when its items
++// don't fill one wave, smallest on ties (a token's reduction expects every slot at one factor).
++// forced > 0 (EXL3_MOE_COOP_KSPLIT) overrides
++__device__ __forceinline__ int pick_ksplit(int forced, int items, int cap, int smax)
++{
++    if (forced > 0) return forced;
++    if (items <= 0 || items >= cap) return 1;
++    smax = min(smax, (int) gridDim.x / items);
++    int best = 1, best_waves = 1;              // waves per item: best_waves / best
++    for (int s = 2; s <= smax; ++s)
++    {
++        const int waves = CEIL_DIVIDE(items * s, cap);
++        if (waves * best < best_waves * s)
++        {
++            best = s;
++            best_waves = waves;
++        }
++    }
++    return best;
++}
++
++// Gate/up stage: the items filling whole waves run unsplit (blocks 0..n_full-1 = items, as
++// without a split); the rest, the last partial wave that a few blocks would otherwise drain
++// alone, split cap / n_tail ways so they fill one wave together (block n_full + q * n_tail + j =
++// split q of item n_full + j). Only for launches of up to three waves: past that the tail is a
++// small share and the split measured a net loss. align consecutive items (one (slot, chunk)
++// arrival group) share a factor. forced > 0 splits every item that many ways. Blocks past the
++// split items get an item index past the end. Returns the launch's split factor (1: nothing
++// split)
++__device__ __forceinline__ int split_item(int forced, int items, int cap, int smax, int align, int& item, int& ks, int& ksplit)
++{
++    const int b = blockIdx.x;
++    int n_full = 0;
++    if (forced <= 0)
++    {
++        n_full = items / cap * cap;
++        n_full -= n_full % align;
++    }
++    const int n_tail = items - n_full;
++    const int s = n_tail == 0 ? 1
++                : forced > 0 ? forced
++                : items >= 3 * cap ? 1
++                : max(1, min(min(smax, cap / n_tail), ((int) gridDim.x - n_full) / n_tail));
++    if (b < n_full || s == 1)
++    {
++        item = b;
++        ks = 0;
++        ksplit = 1;
++        return s;
++    }
++    const int t = b - n_full;
++    item = t < n_tail * s ? n_full + t % n_tail : 0x7fffffff;
++    ks = t / n_tail;
++    ksplit = s;
++    return s;
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // GEMV tile: one 32-column group of an (nrows, k) x (k, n) product, the rows being the run's slots
+ // (row r reads A at A2 + rows[r] * a_stride2 half2 and writes C at rows[r] * c_stride), the whole
+ // block splitting k across its 16 warps. Body follows exl3_gemv_kernel (MMODE 1, CFG 0) for
+ // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
+-// dq_dispatch
++// dq_dispatch. The weight prefetch is issued first; then pre() runs (the caller's remaining
++// setup), a block barrier publishes rows[] and whatever pre() wrote, and the slice loop starts
+ 
+-template <int bits, int cb, bool WIDE>
++template <int bits, int cb, bool WIDE, typename Pre>
+ __device__ __forceinline__ void gemv_tile
+ (
+     const uint32_t* __restrict__ B32,
+     const half2* __restrict__ A2,
+     size_t a_stride2,
+-    const int* __restrict__ rows,
++    const int* __restrict__ rows,       // shared, written before the call, read after the barrier
+     int nrows,
+     void* __restrict__ C,
+     size_t c_stride,
+@@ -352,7 +457,8 @@ __device__ __forceinline__ void gemv_tile
+     int ntiles,
+     int group,                          // block column group of tile_cols<WIDE>() columns
+     float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
+-    uint32_t* __restrict__ sh_stage     // [WK][STAGE_WORDS], staged widths only
++    uint32_t* __restrict__ sh_stage,    // [WK][STAGE_WORDS], staged widths only
++    Pre pre
+ )
+ {
+     constexpr bool REG = tile_reg<bits>();
+@@ -375,10 +481,8 @@ __device__ __forceinline__ void gemv_tile
+     const int myn = max(0, min(chunk, k_end - ks0));
+     const size_t slice_stride = (size_t) ntiles * TWORDS;
+ 
+-    // A fragment row of this lane: rows[lane / 4] of the run
+     const int r0 = lane >> 2;
+     const bool r0_ok = r0 < nrows;
+-    const size_t a_row0 = r0_ok ? (size_t) rows[r0] * a_stride2 : 0;
+     const half2 hzero = __half2half2(__ushort_as_half(0));
+ 
+     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+@@ -400,26 +504,57 @@ __device__ __forceinline__ void gemv_tile
+         x_src_b = i2 % 24;
+     }
+ 
+-    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane;
++    // 3 bpw register path: lanes 24..31 hold no tile word (the shuffles read lanes < 24); they
++    // load lane 23's word so every load is unconditional and stays inside the warp's tiles
++    const int b_lane = (REG && bits == 3) ? min(lane, 23) : lane;
++    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + b_lane;
+     [[maybe_unused]] uint32_t* stage = sh_stage + warp * STAGE_WORDS;
+ 
+-    auto ld_b = [&] (int i, int l) -> uint32_t
++    auto ld_b = [&] (const uint32_t* p, int l) -> uint32_t
+     {
+-        if constexpr (REG && bits == 3)
+-            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+-        else if constexpr (!REG)
+-            return (l * 32 + lane < GWORDS) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
++        if constexpr (!REG)
++            return (l * 32 + lane < GWORDS) ? __ldcs(p + l * LSTRIDE) : 0;
+         else
+-            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
++            return __ldcs(p + l * LSTRIDE);
+     };
+ 
++    // Weight words run PF slices ahead, A fragments (lane covers row lane/4, k pairs (2(lane%4),
++    // +1) and (+8, +9); in L2 at bsz > 1) AD slices ahead. Fetches are unconditional: past the
++    // last slice they re-read it (fetch pointers stop there), which keeps the rings in fixed
++    // registers with no predicated loads in the slice loop
++    const uint32_t* bpf = bp;
+     uint32_t pf[PF][LOADS];
+-    #pragma unroll
+-    for (int d = 0; d < PF; ++d)
+-        if (d < myn)
++    if (myn > 0)
++    {
++        #pragma unroll
++        for (int d = 0; d < PF; ++d)
++        {
+             #pragma unroll
+             for (int l = 0; l < LOADS; ++l)
+-                pf[d][l] = ld_b(d, l);
++                pf[d][l] = ld_b(bpf, l);
++            if (d + 1 < PF && d + 1 < myn) bpf += slice_stride;
++        }
++    }
++
++    pre();
++    __syncthreads();
++
++    // A fragment row of this lane: rows[lane / 4] of the run. Lanes past the run's last row read
++    // that row again, and the MMA's upper 8 rows take whatever the registers hold: rows of an
++    // m16 MMA are independent and only rows < nrows reach sh_red, so neither affects an output
++    const size_t a_row0 = (size_t) rows[min(lane >> 2, nrows - 1)] * a_stride2;
++    const half2* apf_p = A2 + a_row0 + (size_t) ks0 * 8 + (lane & 3);
++    half2 apf[AD][2];
++    if (myn > 0)
++    {
++        #pragma unroll
++        for (int d = 0; d < AD; ++d)
++        {
++            apf[d][0] = apf_p[0];
++            apf[d][1] = apf_p[4];
++            if (d + 1 < AD && d + 1 < myn) apf_p += 8;
++        }
++    }
+ 
+     FragC_h ch[WNT][2] = {};
+     float2 acc0[WNT][2] = {};
+@@ -437,12 +572,10 @@ __device__ __forceinline__ void gemv_tile
+             for (int l = 0; l < LOADS; ++l)
+                 bw[l] = pf[d][l];
+ 
+-            if (i + PF < myn)
+-            {
+-                #pragma unroll
+-                for (int l = 0; l < LOADS; ++l)
+-                    pf[d][l] = ld_b(i + PF, l);
+-            }
++            if (i + PF < myn) bpf += slice_stride;
++            #pragma unroll
++            for (int l = 0; l < LOADS; ++l)
++                pf[d][l] = ld_b(bpf, l);
+ 
+             if constexpr (!REG)
+             {
+@@ -454,13 +587,14 @@ __device__ __forceinline__ void gemv_tile
+                 __syncwarp();
+             }
+ 
+-            // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
+-            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+             FragB a01, a23;
+-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+-            a01[1] = hzero;
+-            a23[1] = hzero;
++            a01[0] = apf[d % AD][0];
++            a23[0] = apf[d % AD][1];
++            a01[1] = undef_h2();
++            a23[1] = undef_h2();
++            if (i + AD < myn) apf_p += 8;
++            apf[d % AD][0] = apf_p[0];
++            apf[d % AD][1] = apf_p[4];
+ 
+             #pragma unroll
+             for (int t = 0; t < WNT; ++t)
+@@ -673,7 +807,7 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
+ // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
+ 
+ template <int bits, int cb, bool WIDE>
+-__global__ __launch_bounds__(THREADS)
++__global__ __launch_bounds__(THREADS, tile_min_blocks<bits>())
+ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ {
+     constexpr int TCOLS = tile_cols<WIDE>();
+@@ -684,7 +818,6 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+     float* sh_red = (float*) (smem_dyn + p.Hi / 2);
+     uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
+     __shared__ int sh_flag;
+-    __shared__ int sh_res[4];
+     __shared__ int sh_rows[ROWS];
+ 
+     const int warp = threadIdx.x / 32;
+@@ -696,58 +829,58 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
+         p.ctr_b[i] = 0;
+ 
+-    const int item = blockIdx.x;
++    // Item (run, group, projection; projection fastest) and k-split of this block. A (slot,
++    // 128-chunk) gathers GPC groups x nproj projections, which split_item keeps at one factor
++    const int n_runs = run_count(p);
++    int item, ks, ksplit;
++    const int split = split_item(p.ksplit_a, n_runs * ng * nproj, p.cap_a, p.split_max_a, GPC * nproj, item, ks, ksplit);
++    // Partials are fp32 whatever the scratch dtype in a launch that splits (a half scratch holds
++    // half the rows), unsplit items included: one row format per launch keeps the rows disjoint
++    const bool part_f32 = p.gu_f32 || split > 1;
++
+     const bool is_gate = p.gated && (item % nproj) == 0;
+-    const int rem = item / nproj;
+-    const int ks = rem % p.ksplit_a;                 // split-k index: partial output rows
+-    const int rem2 = rem / p.ksplit_a;
++    const int rem2 = item / nproj;
+     const int run_idx = rem2 / ng;
+     const int group = rem2 % ng;
+-    int nrows = 0;
+-    if (!read_run(p, run_idx, sh_rows, nrows, sh_res))
++    int nrows = 0, local = 0;
++    if (!read_run(p, run_idx, n_runs, sh_rows, nrows, local))
+     {
+-        // bsz 1: an inactive slot's blocks (up projection, split 0) write the output chunks of an
+-        // empty token row, one warp per chunk, strided by the number of gate/up groups
+-        if (!p.a_global && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
+-        {
+-            const int row = run_idx / p.topk;
+-            if (token_active_slots(p, row) == 0)
+-                for (int oc = group + warp * ng; oc < p.Ho / 128; oc += ng * WK)
+-                    write_empty_row_chunk(p, row, oc, lane);
+-        }
++        // bsz 1 with no active slot (every pick in another expert range): the up-projection
++        // blocks of split 0 of run 0 write the empty row's output chunks, one warp per chunk,
++        // strided by the number of gate/up groups
++        if (!p.a_global && n_runs == 0 && run_idx == 0 && !is_gate && ks == 0)
++            for (int oc = group + warp * ng; oc < p.Ho / 128; oc += ng * WK)
++                write_empty_row_chunk(p, 0, oc, lane);
+         return;
+     }
+-    const int local = slot_info(p, sh_rows[0]).local;
+     const int kslices_all = p.Hi / 16;
+-    const int k_begin = kslices_all * ks / p.ksplit_a;
+-    const int k_end = kslices_all * (ks + 1) / p.ksplit_a;
++    const int k_begin = kslices_all * ks / ksplit;
++    const int k_end = kslices_all * (ks + 1) / ksplit;
+ 
+-    const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[local];
+-    const half2* A2;
+-    size_t a_stride2;
++    const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];
++    // Partial output rows of split ks live at slot + ks * slots (ksplit * slots rows fit)
++    const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (part_f32 ? 4 : 2);
++    void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
+     if (p.a_global)
+     {
+-        A2 = (const half2*) (is_gate ? p.had_g : p.had_u);
+-        a_stride2 = (size_t) p.Hi / 2;
++        const half2* A2 = (const half2*) (is_gate ? p.had_g : p.had_u);
++        gemv_tile<bits, cb, WIDE>(B32, A2, (size_t) p.Hi / 2, sh_rows, nrows, C, p.I, part_f32, k_begin, k_end,
++                                  p.I / 16, group, sh_red, sh_stage, [] {});
+     }
+     else
+     {
+-        // bsz 1: every run is a single slot; rotate its input into shared memory here. A zero
+-        // row stride makes the tile read it whatever the slot index (which still selects the C row)
+-        const SlotInfo si = slot_info(p, sh_rows[0]);
+-        for (int c = warp; c < p.Hi / 128; c += WK)
+-            rotate_chunk(p, si.row, suh, c, sh_A, lane);
+-        __syncthreads();
+-        A2 = (const half2*) sh_A;
+-        a_stride2 = 0;
+-    }
+-
+-    {
+-        const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];
+-        // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
+-        const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
+-        void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
+-        gemv_tile<bits, cb, WIDE>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
++        // bsz 1: every run is a single slot of token row 0; rotate its input into shared memory
++        // while the weight prefetch is in flight (the 128-chunks covering this split's k range).
++        // A zero row stride makes the tile read it whatever the slot index (which still selects
++        // the C row)
++        auto rotate = [&]
++        {
++            const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[local];
++            for (int c = k_begin / 8 + warp; c < CEIL_DIVIDE(k_end, 8); c += WK)
++                rotate_chunk(p, 0, suh, c, sh_A, lane);
++        };
++        gemv_tile<bits, cb, WIDE>(B32, (const half2*) sh_A, 0, sh_rows, nrows, C, p.I, part_f32, k_begin, k_end,
++                                  p.I / 16, group, sh_red, sh_stage, rotate);
+     }
+ 
+     for (int r = 0; r < nrows; ++r)
+@@ -755,7 +888,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+     {
+         const int s = sh_rows[r];
+         const int chunk = (group * CPB + j) / GPC;
+-        if (!arrive_last(p.ctr_a + (size_t) s * (p.I / 128) + chunk, GPC * nproj * p.ksplit_a, &sh_flag)) continue;
++        if (!arrive_last(p.ctr_a + (size_t) s * (p.I / 128) + chunk, GPC * nproj * ksplit, &sh_flag)) continue;
+         if (p.dbg & 1) continue;
+         if (warp == 0)
+         {
+@@ -767,10 +900,10 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+             auto load_sum = [&] (const void* buf, float& v0, float& v1, float& v2, float& v3)
+             {
+                 v0 = v1 = v2 = v3 = 0.0f;
+-                for (int q = 0; q < p.ksplit_a; ++q)
++                for (int q = 0; q < ksplit; ++q)
+                 {
+                     float t0, t1, t2, t3;
+-                    if (p.gu_f32) load_f4_cg(((const float*) buf) + q * pstride + off, t0, t1, t2, t3);
++                    if (part_f32) load_f4_cg(((const float*) buf) + q * pstride + off, t0, t1, t2, t3);
+                     else          load_h4_cg(((const half*) buf) + q * pstride + off, t0, t1, t2, t3);
+                     v0 += t0; v1 += t1; v2 += t2; v3 += t3;
+                 }
+@@ -809,7 +942,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ // expert and stores the trimmed row
+ 
+ template <int bits, int cb, bool WIDE>
+-__global__ __launch_bounds__(THREADS)
++__global__ __launch_bounds__(THREADS, tile_min_blocks<bits>())
+ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+ {
+     constexpr int TCOLS = tile_cols<WIDE>();
+@@ -822,7 +955,6 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+     __shared__ int sh_flag;
+     __shared__ int sh_n_active;
+     __shared__ float sh_gate;
+-    __shared__ int sh_res[4];
+     __shared__ int sh_rows[ROWS];
+ 
+     const int warp = threadIdx.x / 32;
+@@ -833,23 +965,24 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
+         p.ctr_a[i] = 0;
+ 
++    const int n_runs = run_count(p);
++    const int ksplit = pick_ksplit(p.ksplit_b, n_runs * ng, p.cap_b, p.split_max_b);
+     const int item = blockIdx.x;
+-    const int ks = item % p.ksplit_b;
+-    const int rem = item / p.ksplit_b;
++    const int ks = item % ksplit;
++    const int rem = item / ksplit;
+     const int run_idx = rem / ng;
+     const int group = rem % ng;
+-    int nrows = 0;
+-    if (!read_run(p, run_idx, sh_rows, nrows, sh_res)) return;
+-    const int local = slot_info(p, sh_rows[0]).local;
++    int nrows = 0, local = 0;
++    if (!read_run(p, run_idx, n_runs, sh_rows, nrows, local)) return;
+     const int kslices_all = p.I / 16;
+-    const int k_begin = kslices_all * ks / p.ksplit_b;
+-    const int k_end = kslices_all * (ks + 1) / p.ksplit_b;
++    const int k_begin = kslices_all * ks / ksplit;
++    const int k_end = kslices_all * (ks + 1) / ksplit;
+ 
+     {
+         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
+         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
+         gemv_tile<bits, cb, WIDE>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
++                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, [] {});
+     }
+ 
+     for (int r = 0; r < nrows; ++r)
+@@ -868,7 +1001,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+             sh_n_active = n;
+         }
+         __syncthreads();
+-        if (!arrive_last(p.ctr_b + (size_t) row * (p.Ho / 128) + chunk, sh_n_active * GPC * p.ksplit_b, &sh_flag)) continue;
++        if (!arrive_last(p.ctr_b + (size_t) row * (p.Ho / 128) + chunk, sh_n_active * GPC * ksplit, &sh_flag)) continue;
+         if (p.dbg & 2) continue;
+ 
+         const int col = chunk * 128 + lane * 4;
+@@ -906,7 +1039,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+             const SlotInfo sj = slot_info(p, sk);
+             if (!sj.active) continue;
+             float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+-            for (int q = 0; q < p.ksplit_b; ++q)     // split-k partials, fixed order
++            for (int q = 0; q < ksplit; ++q)         // split-k partials, fixed order
+             {
+                 float t0, t1, t2, t3;
+                 load_f4_cg(p.d_out + ((size_t) q * (p.bsz * p.topk) + sk) * p.Ho + col, t0, t1, t2, t3);
+-- 
+2.51.0
+

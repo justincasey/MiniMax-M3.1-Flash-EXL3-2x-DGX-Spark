@@ -1,0 +1,1659 @@
+From 6a8b52471cca8f6787815d213a4a4b84a53b0f78 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:03:57 -0500
+Subject: [PATCH] Grouped fat-expert MoE prefill; opt-in FP8 dense prefill
+
+Grouped fat tier (default on, VLLM_EXL3_FAT_GROUPED=0 restores the per-expert loop):
+- exl3_fat_gemm_grouped: one fused dequant+MMA launch per (K, codebook) class per
+  projection for all fat experts of a layer (per-expert row bounds and trellis/svh
+  pointer tables), 64-wide K stages with register double-buffering, atomic scatter.
+- exl3_had_r_128_grouped (fused row gather) and exl3_act_had_r_128_grouped (clamp +
+  activation + fp16 round + down-input Hadamard) replace ~13 launches per expert.
+- Gate shape (128 experts, 32K rows, 6144->1536, K3): 49.7 -> 12.9 ms. Outputs equal
+  the per-expert kernels (tests/gpu/test_fat_gemm_grouped.py).
+
+FP8 dense prefill (VLLM_EXL3_FP8_PREFILL=1, off by default):
+- Rotated-basis e4m3: per-row quantized had(x*suh), per-tensor FP8 bare trellis
+  weight, tensorwise torch._scaled_mm (bf16 out), row/weight rescale + output
+  Hadamard written straight into each shard's slice of one bf16 output.
+- 1.56-1.62x per dense linear; +7.5% prefill on MiniMax-M3.1 2.15bpw TP2, but long
+  NLL +3-6%, so it stays opt-in. VLLM_EXL3_FP8_PREFILL_SKIP excludes layers by regex.
+
+The new env knobs are apply-only in the weight-snapshot key.
+---
+ csrc/bindings.cpp                   |   7 +
+ csrc/exl3_fat_gemm.cu               | 358 ++++++++++++++++++++++++++++
+ csrc/exl3_fat_gemm.cuh              |  11 +
+ csrc/exl3_fp8_prefill.cu            | 247 +++++++++++++++++++
+ csrc/exl3_fp8_prefill.cuh           |   6 +
+ setup.py                            |   1 +
+ src/vllm_exl3/exl3.py               | 316 +++++++++++++++++++++++-
+ src/vllm_exl3/weight_snapshot.py    |   2 +
+ tests/gpu/bench_fat_gemm.py         |  22 ++
+ tests/gpu/bench_fp8_dense.py        |  55 +++++
+ tests/gpu/bench_fp8_variants.py     |  52 ++++
+ tests/gpu/test_fat_gemm_any_k.py    |  33 +++
+ tests/gpu/test_fat_gemm_grouped.py  | 205 ++++++++++++++++
+ tests/gpu/test_fp8_dense_prefill.py | 130 ++++++++++
+ 14 files changed, 1433 insertions(+), 12 deletions(-)
+ create mode 100644 csrc/exl3_fp8_prefill.cu
+ create mode 100644 csrc/exl3_fp8_prefill.cuh
+ create mode 100644 tests/gpu/bench_fat_gemm.py
+ create mode 100644 tests/gpu/bench_fp8_dense.py
+ create mode 100644 tests/gpu/bench_fp8_variants.py
+ create mode 100644 tests/gpu/test_fat_gemm_any_k.py
+ create mode 100644 tests/gpu/test_fat_gemm_grouped.py
+ create mode 100644 tests/gpu/test_fp8_dense_prefill.py
+
+diff --git a/csrc/bindings.cpp b/csrc/bindings.cpp
+index 6c20e11..0a6772b 100644
+--- a/csrc/bindings.cpp
++++ b/csrc/bindings.cpp
+@@ -9,6 +9,7 @@
+ #include "p2b_moe.cuh"
+ #include "exl3_gemm.cuh"
+ #include "exl3_fat_gemm.cuh"
++#include "exl3_fp8_prefill.cuh"
+ 
+ namespace {
+ 
+@@ -258,6 +259,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+ 
+     // Trellis widths the fat GEMM kernels accept (the original kernel was K4 MCG only).
+     m.attr("EXL3_FAT_GEMM_MAX_K") = 8;
++    m.def("exl3_had_quant_fp8_rows", &exl3_had_quant_fp8_rows, "Input Hadamard (suh) + per-row e4m3 quantization");
++    m.def("exl3_fp16_to_fp8_t", &exl3_fp16_to_fp8_t, "Scaled transpose-cast of a reconstructed weight to e4m3 [N, K]");
++    m.def("exl3_had_rows_bf16", &exl3_had_rows_bf16, "Row/weight rescale + output Hadamard (svh), bf16 in, fp32/bf16/fp16 out (column slice ok)");
++    m.def("exl3_fat_gemm_grouped", &exl3_fat_gemm_grouped, "Native EXL3 fat GEMM, one launch per expert group");
++    m.def("exl3_had_r_128_grouped", &exl3_had_r_128_grouped, "Pre-scaled Hadamard with a scale vector per row group, optional row gather");
++    m.def("exl3_act_had_r_128_grouped", &exl3_act_had_r_128_grouped, "Fused MoE clamp + activation + fp16 round + pre-scaled Hadamard per row group");
+     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
+           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
+           py::arg("K"), py::arg("mcg"), py::arg("mul1"));
+diff --git a/csrc/exl3_fat_gemm.cu b/csrc/exl3_fat_gemm.cu
+index 3dc4453..a007d96 100644
+--- a/csrc/exl3_fat_gemm.cu
++++ b/csrc/exl3_fat_gemm.cu
+@@ -29,6 +29,7 @@ constexpr int FAT_TILE_K = 16;
+ constexpr int FAT_TILE_N = 128;
+ constexpr int FAT_M_BLOCKS = FAT_TILE_M / 16;
+ constexpr int FAT_N_BLOCKS = FAT_TILE_N / 16;
++constexpr int FAT_K_SUB = 4;  // grouped kernel: 16-wide K sub-blocks per pipeline stage
+ constexpr float HAD_SCALE = 0.088388347648f;
+ 
+ __device__ inline void fat_had_ff_128(
+@@ -200,6 +201,230 @@ void exl3_fat_gemm_kernel(
+     }
+ }
+ 
++// One 16x16 trellis tile packs 256 weights at K bits: 16 * K int16 words.
++template <int K, int CB, bool scatter>
++__global__ __launch_bounds__(FAT_THREADS)
++void exl3_fat_gemm_grouped_kernel(
++    const half* __restrict__ a,
++    const int64_t* __restrict__ packed_ptrs,
++    float* __restrict__ out,
++    const int64_t* __restrict__ svh_ptrs,
++    const int* __restrict__ row_bounds,
++    const int64_t* __restrict__ token_idx,
++    const half* __restrict__ route_weight,
++    int size_k,
++    int size_n)
++{
++    constexpr int FAT_PACKED_WORDS = 16 * K;
++    extern __shared__ unsigned char shared_raw[];
++    half* sh_a = reinterpret_cast<half*>(shared_raw);
++    uint16_t* sh_b = reinterpret_cast<uint16_t*>(sh_a + FAT_K_SUB * FAT_TILE_M * FAT_TILE_K);
++    float* sh_c = reinterpret_cast<float*>(sh_b + FAT_K_SUB * FAT_N_BLOCKS * FAT_PACKED_WORDS);
++
++    int t = threadIdx.x;
++    int warp = t / 32;
++    int lane = t & 31;
++    // Grouped: blockIdx.z selects the expert; its rows are [row_bounds[2z], row_bounds[2z + 1])
++    // of the shared, expert-sorted ``a`` and its trellis/svh come from the pointer tables.
++    const int g = blockIdx.z;
++    const int size_m = row_bounds[2 * g + 1];
++    int m_base = row_bounds[2 * g] + blockIdx.y * FAT_TILE_M;
++    if (m_base >= size_m) return;
++    const uint16_t* __restrict__ packed = reinterpret_cast<const uint16_t*>(packed_ptrs[g]);
++    const half* __restrict__ svh = reinterpret_cast<const half*>(svh_ptrs[g]);
++    int n_base = blockIdx.x * FAT_TILE_N;
++    int tiles_n = size_n / 16;
++
++    FragC frag_c[FAT_M_BLOCKS][2];
++    #pragma unroll
++    for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
++    {
++        frag_c[mb][0] = {};
++        frag_c[mb][1] = {};
++    }
++
++    // Stages of FAT_K_SUB 16-wide sub-blocks; the next stage's A/B words are held in
++    // registers (loads in flight) while this stage's MMAs run.
++    const int a_row = t / 2;
++    const int a_col8 = t & 1;
++    const int a_dst_col8 = a_col8 ^ ((a_row >> 2) & 1);
++    const bool a_valid = m_base + a_row < size_m;
++    const half* a_row_ptr = a + static_cast<size_t>(m_base + a_row) * size_k;
++    int4 reg_a[FAT_K_SUB];
++    int4 reg_b[FAT_K_SUB];
++    auto load_stage = [&](int stage) {
++        #pragma unroll
++        for (int sub = 0; sub < FAT_K_SUB; ++sub)
++        {
++            const int k_block = stage * FAT_K_SUB + sub;
++            reg_a[sub] = a_valid
++                ? reinterpret_cast<const int4*>(a_row_ptr + k_block * FAT_TILE_K)[a_col8]
++                : int4{};
++            if (t < 16 * K)
++                reg_b[sub] = reinterpret_cast<const int4*>(
++                    packed + (static_cast<size_t>(k_block) * tiles_n + n_base / 16) * FAT_PACKED_WORDS)[t];
++        }
++    };
++    const int stages = size_k / (FAT_TILE_K * FAT_K_SUB);
++    load_stage(0);
++    for (int stage = 0; stage < stages; ++stage)
++    {
++        #pragma unroll
++        for (int sub = 0; sub < FAT_K_SUB; ++sub)
++        {
++            reinterpret_cast<int4*>(sh_a + sub * FAT_TILE_M * FAT_TILE_K)[a_row * 2 + a_dst_col8] = reg_a[sub];
++            if (t < 16 * K)
++                reinterpret_cast<int4*>(sh_b + sub * FAT_N_BLOCKS * FAT_PACKED_WORDS)[t] = reg_b[sub];
++        }
++        __syncthreads();
++        if (stage + 1 < stages) load_stage(stage + 1);
++
++        #pragma unroll
++        for (int sub = 0; sub < FAT_K_SUB; ++sub)
++        {
++            FragB frag_b0;
++            FragB frag_b1;
++            const uint32_t* warp_b = reinterpret_cast<const uint32_t*>(
++                sh_b + sub * FAT_N_BLOCKS * FAT_PACKED_WORDS + warp * FAT_PACKED_WORDS);
++            dq_dispatch<K, CB>(warp_b, lane << 3, frag_b0, frag_b1);
++            const int4* sub_a = reinterpret_cast<const int4*>(sh_a + sub * FAT_TILE_M * FAT_TILE_K);
++
++            #pragma unroll
++            for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
++            {
++                FragA frag_a;
++                int row = (lane % 8) + 8 * ((lane / 8) % 2) + mb * 16;
++                int base_col = lane / 16;
++                int swizzled_col = base_col ^ ((row >> 2) & 1);
++                ldsm4(frag_a, const_cast<int4*>(sub_a) + row * 2 + swizzled_col);
++                ptx_mma_m16n8k16(frag_a, frag_b0, frag_c[mb][0]);
++                ptx_mma_m16n8k16(frag_a, frag_b1, frag_c[mb][1]);
++            }
++        }
++        __syncthreads();
++    }
++
++    #pragma unroll
++    for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
++    {
++        int rows = min(16, size_m - (m_base + mb * 16));
++        if (rows <= 0) break;
++        int row0 = lane / 4;
++        int row1 = row0 + 8;
++        int col = (lane % 4) * 2;
++        int n0 = warp * 16;
++        if (row0 < rows)
++        {
++            float* dst0 = sh_c + row0 * FAT_TILE_N + n0 + col;
++            dst0[0] = frag_c[mb][0][0];
++            dst0[1] = frag_c[mb][0][1];
++            dst0[8] = frag_c[mb][1][0];
++            dst0[9] = frag_c[mb][1][1];
++        }
++        if (row1 < rows)
++        {
++            float* dst1 = sh_c + row1 * FAT_TILE_N + n0 + col;
++            dst1[0] = frag_c[mb][0][2];
++            dst1[1] = frag_c[mb][0][3];
++            dst1[8] = frag_c[mb][1][2];
++            dst1[9] = frag_c[mb][1][3];
++        }
++        __syncthreads();
++
++        for (int row = warp; row < rows; row += 8)
++        {
++            fat_had_ff_128(
++                sh_c + row * FAT_TILE_N,
++                sh_c + row * FAT_TILE_N,
++                svh + n_base);
++        }
++        __syncthreads();
++
++        for (int i = t; i < rows * FAT_TILE_N; i += FAT_THREADS)
++        {
++            int row = i / FAT_TILE_N;
++            int col_out = i % FAT_TILE_N;
++            int source_row = m_base + mb * 16 + row;
++            float value = sh_c[i];
++            if constexpr (scatter)
++            {
++                int64_t destination = token_idx[source_row];
++                value *= __half2float(route_weight[source_row]);
++                // Experts of one launch can share a token: accumulate atomically.
++                atomicAdd(out + destination * size_n + n_base + col_out, value);
++            }
++            else
++            {
++                out[source_row * size_n + n_base + col_out] = value;
++            }
++        }
++        __syncthreads();
++    }
++}
++
++
++// Grouped pre-scaled Hadamard over expert-sorted rows: row r uses the half[cols]
++// scale vector scale_ptrs[row_group[r]] (exllamav3 had_r_128 with pre_scale).
++// With ``gather`` set, output row r reads input row gather[r] (fused index_select).
++__global__ __launch_bounds__(32)
++void had_hf_r_128_grouped_kernel(
++    const half* __restrict__ input_ptr,
++    half* __restrict__ output_ptr,
++    const int* __restrict__ row_group,
++    const int64_t* __restrict__ scale_ptrs,
++    const int64_t* __restrict__ gather,
++    const float r_scale)
++{
++    const half* scale = reinterpret_cast<const half*>(scale_ptrs[row_group[blockIdx.x]]);
++    const size_t src_row = gather ? static_cast<size_t>(gather[blockIdx.x]) : blockIdx.x;
++    input_ptr += (size_t) gridDim.y * 128 * src_row + blockIdx.y * 128;
++    output_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
++    had_hf_r_128_inner<true, false>(input_ptr, output_ptr, scale, r_scale);
++}
++
++// Fused MoE activation + down-projection input transform over expert-sorted rows:
++// clamp (limit > 0), act (0: SiLU gate*sigmoid(gate)*up, 1: SwiGLU-OAI
++// gate*sigmoid(alpha*gate)*(up+1)), round to fp16, then the pre-scaled 128-wide
++// Hadamard with row r's scale vector scale_ptrs[row_group[r]]. Same math as the
++// torch clamp/act/cast followed by had_r_128(act_h, out, suh), in one pass.
++__global__ __launch_bounds__(32)
++void act_had_r_128_grouped_kernel(
++    const float* __restrict__ gate,
++    const float* __restrict__ up,
++    half* __restrict__ output_ptr,
++    const int* __restrict__ row_group,
++    const int64_t* __restrict__ scale_ptrs,
++    const float limit,
++    const float alpha,
++    const int act,
++    const float r_scale)
++{
++    __shared__ __align__(16) half act_h[128];
++    const int t = threadIdx.x;
++    const size_t off = (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128 + t * 4;
++    const float4 g4 = *reinterpret_cast<const float4*>(gate + off);
++    const float4 u4 = *reinterpret_cast<const float4*>(up + off);
++    float g[4] = {g4.x, g4.y, g4.z, g4.w};
++    float u[4] = {u4.x, u4.y, u4.z, u4.w};
++    #pragma unroll
++    for (int i = 0; i < 4; ++i)
++    {
++        if (limit > 0.0f)
++        {
++            g[i] = fminf(g[i], limit);
++            u[i] = fminf(fmaxf(u[i], -limit), limit);
++        }
++        float a = act == 1
++            ? g[i] * (1.0f / (1.0f + __expf(-alpha * g[i]))) * (u[i] + 1.0f)
++            : g[i] * (1.0f / (1.0f + __expf(-g[i]))) * u[i];
++        act_h[t * 4 + i] = __float2half_rn(a);
++    }
++    __syncwarp();
++    const half* scale = reinterpret_cast<const half*>(scale_ptrs[row_group[blockIdx.x]]);
++    output_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
++    had_hf_r_128_inner<true, false>(act_h, output_ptr, scale, r_scale);
++}
++
+ void check_common(
+     const at::Tensor& a,
+     const at::Tensor& packed,
+@@ -293,6 +518,52 @@ void launch(int64_t K, bool mcg, bool mul1, at::Tensor a, at::Tensor packed, at:
+     else launch_cb<0, scatter>(K, a, packed, out, svh, token_idx, route_weight);
+ }
+ 
++
++template <int K, int CB, bool scatter>
++void launch_grouped_k(
++    at::Tensor a, at::Tensor packed_ptrs, at::Tensor out, at::Tensor svh_ptrs, at::Tensor row_bounds,
++    at::Tensor token_idx, at::Tensor route_weight, int64_t size_n, int64_t max_rows)
++{
++    const at::cuda::OptionalCUDAGuard device_guard(a.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    int groups = static_cast<int>(packed_ptrs.numel());
++    int size_k = static_cast<int>(a.size(1));
++    dim3 block(FAT_THREADS);
++    dim3 grid(static_cast<int>(size_n) / FAT_TILE_N, (static_cast<int>(max_rows) + FAT_TILE_M - 1) / FAT_TILE_M, groups);
++    size_t shared = FAT_K_SUB * FAT_TILE_M * FAT_TILE_K * sizeof(half)
++                  + FAT_K_SUB * FAT_N_BLOCKS * 16 * K * sizeof(uint16_t)
++                  + 16 * FAT_TILE_N * sizeof(float);
++    exl3_fat_gemm_grouped_kernel<K, CB, scatter><<<grid, block, shared, stream>>>(
++        reinterpret_cast<const half*>(a.data_ptr()),
++        reinterpret_cast<const int64_t*>(packed_ptrs.data_ptr()),
++        reinterpret_cast<float*>(out.data_ptr()),
++        reinterpret_cast<const int64_t*>(svh_ptrs.data_ptr()),
++        reinterpret_cast<const int*>(row_bounds.data_ptr()),
++        scatter ? reinterpret_cast<const int64_t*>(token_idx.data_ptr()) : nullptr,
++        scatter ? reinterpret_cast<const half*>(route_weight.data_ptr()) : nullptr,
++        size_k,
++        static_cast<int>(size_n));
++    cuda_check(cudaPeekAtLastError());
++}
++
++template <int CB, bool scatter>
++void launch_grouped_cb(int64_t K, at::Tensor a, at::Tensor pp, at::Tensor out, at::Tensor sp, at::Tensor rs,
++                       at::Tensor ti, at::Tensor rw, int64_t n, int64_t mr)
++{
++    switch (K)
++    {
++        case 1: launch_grouped_k<1, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 2: launch_grouped_k<2, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 3: launch_grouped_k<3, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 4: launch_grouped_k<4, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 5: launch_grouped_k<5, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 6: launch_grouped_k<6, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 7: launch_grouped_k<7, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 8: launch_grouped_k<8, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        default: TORCH_CHECK(false, "exl3_fat_gemm_grouped: unsupported K ", K);
++    }
++}
++
+ }  // namespace
+ 
+ void exl3_fat_gemm(
+@@ -335,3 +606,90 @@ void exl3_fat_gemm_scatter(
+                 "routing tensors must share a device with a");
+     launch<true>(K, mcg, mul1, a, packed, out, svh, token_idx, route_weight);
+ }
++
++// Grouped variants: one launch for every expert of one (K, codebook) class.
++// ``a`` holds the expert-sorted rows; expert g owns rows [row_bounds[2g], row_bounds[2g+1]);
++// packed_ptrs / svh_ptrs are int64 device tables of its trellis and svh base pointers.
++// max_rows bounds the per-expert row count (grid y). Scatter accumulates
++// route_weight * row into out[token_idx[row]] (one route per token per expert).
++void exl3_fat_gemm_grouped(
++    at::Tensor a, at::Tensor packed_ptrs, at::Tensor out, at::Tensor svh_ptrs, at::Tensor row_bounds,
++    at::Tensor token_idx, at::Tensor route_weight, int64_t K, bool mcg, bool mul1, bool scatter,
++    int64_t size_n, int64_t max_rows)
++{
++    TORCH_CHECK(a.is_cuda() && a.scalar_type() == at::kHalf && a.is_contiguous() && a.dim() == 2,
++                "a must be a contiguous float16 CUDA matrix");
++    TORCH_CHECK(out.scalar_type() == at::kFloat && out.is_contiguous() && out.size(1) == size_n,
++                "out must be contiguous float32 [*, size_n]");
++    TORCH_CHECK(packed_ptrs.scalar_type() == at::kLong && svh_ptrs.scalar_type() == at::kLong &&
++                packed_ptrs.numel() == svh_ptrs.numel(), "pointer tables must be int64 of equal length");
++    TORCH_CHECK(row_bounds.scalar_type() == at::kInt && row_bounds.numel() == 2 * packed_ptrs.numel(),
++                "row_bounds must be int32 [2 * groups] (start, end) pairs");
++    TORCH_CHECK(K >= 1 && K <= 8, "K 1..8");
++    TORCH_CHECK(!(mcg && mul1), "mcg and mul1 are exclusive");
++    TORCH_CHECK(size_n % FAT_TILE_N == 0 && a.size(1) % (FAT_TILE_K * FAT_K_SUB) == 0, "size_n % 128, size_k % 64");
++    if (packed_ptrs.numel() == 0 || max_rows <= 0) return;
++    if (scatter)
++    {
++        TORCH_CHECK(token_idx.scalar_type() == at::kLong && route_weight.scalar_type() == at::kHalf &&
++                    token_idx.numel() == a.size(0) && route_weight.numel() == a.size(0),
++                    "scatter needs int64 token_idx and float16 route_weight per row");
++        if (mcg) launch_grouped_cb<1, true>(K, a, packed_ptrs, out, svh_ptrs, row_bounds, token_idx, route_weight, size_n, max_rows);
++        else if (mul1) launch_grouped_cb<2, true>(K, a, packed_ptrs, out, svh_ptrs, row_bounds, token_idx, route_weight, size_n, max_rows);
++        else launch_grouped_cb<0, true>(K, a, packed_ptrs, out, svh_ptrs, row_bounds, token_idx, route_weight, size_n, max_rows);
++    }
++    else
++    {
++        TORCH_CHECK(out.size(0) == a.size(0), "non-scatter out must have a's rows");
++        if (mcg) launch_grouped_cb<1, false>(K, a, packed_ptrs, out, svh_ptrs, row_bounds, at::Tensor(), at::Tensor(), size_n, max_rows);
++        else if (mul1) launch_grouped_cb<2, false>(K, a, packed_ptrs, out, svh_ptrs, row_bounds, at::Tensor(), at::Tensor(), size_n, max_rows);
++        else launch_grouped_cb<0, false>(K, a, packed_ptrs, out, svh_ptrs, row_bounds, at::Tensor(), at::Tensor(), size_n, max_rows);
++    }
++}
++
++// gather: empty, or int64 [output rows] of input rows (fused index_select).
++void exl3_had_r_128_grouped(at::Tensor input, at::Tensor output, at::Tensor row_group, at::Tensor scale_ptrs,
++                            at::Tensor gather)
++{
++    const bool gathered = gather.numel() > 0;
++    TORCH_CHECK(input.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf &&
++                input.is_contiguous() && output.is_contiguous() && input.dim() == 2 && output.dim() == 2 &&
++                input.size(1) == output.size(1) && input.size(1) % 128 == 0,
++                "contiguous float16 [rows, 128*n] in/out");
++    TORCH_CHECK(gathered ? (gather.scalar_type() == at::kLong && gather.numel() == output.size(0))
++                         : input.size(0) == output.size(0), "gather int64 [output rows], or equal row counts");
++    TORCH_CHECK(row_group.scalar_type() == at::kInt && row_group.numel() == output.size(0), "row_group int32 [rows]");
++    TORCH_CHECK(scale_ptrs.scalar_type() == at::kLong, "scale_ptrs int64");
++    if (output.size(0) == 0) return;
++    const at::cuda::OptionalCUDAGuard device_guard(input.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    dim3 grid(static_cast<int>(output.size(0)), static_cast<int>(output.size(1) / 128));
++    had_hf_r_128_grouped_kernel<<<grid, 32, 0, stream>>>(
++        reinterpret_cast<const half*>(input.data_ptr()), reinterpret_cast<half*>(output.data_ptr()),
++        reinterpret_cast<const int*>(row_group.data_ptr()), reinterpret_cast<const int64_t*>(scale_ptrs.data_ptr()),
++        gathered ? reinterpret_cast<const int64_t*>(gather.data_ptr()) : nullptr, 0.088388347648f);
++    cuda_check(cudaPeekAtLastError());
++}
++
++void exl3_act_had_r_128_grouped(at::Tensor gate, at::Tensor up, at::Tensor output, at::Tensor row_group,
++                                at::Tensor scale_ptrs, double limit, double alpha, int64_t act)
++{
++    TORCH_CHECK(gate.scalar_type() == at::kFloat && up.scalar_type() == at::kFloat && gate.is_contiguous() &&
++                up.is_contiguous() && gate.sizes() == up.sizes() && gate.dim() == 2 && gate.size(1) % 128 == 0,
++                "gate/up contiguous float32 [rows, 128*n]");
++    TORCH_CHECK(output.scalar_type() == at::kHalf && output.is_contiguous() && output.sizes() == gate.sizes(),
++                "output contiguous float16 like gate");
++    TORCH_CHECK(row_group.scalar_type() == at::kInt && row_group.numel() == gate.size(0), "row_group int32 [rows]");
++    TORCH_CHECK(scale_ptrs.scalar_type() == at::kLong, "scale_ptrs int64");
++    TORCH_CHECK(act == 0 || act == 1, "act 0 (SiLU) or 1 (SwiGLU-OAI)");
++    if (gate.size(0) == 0) return;
++    const at::cuda::OptionalCUDAGuard device_guard(gate.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    dim3 grid(static_cast<int>(gate.size(0)), static_cast<int>(gate.size(1) / 128));
++    act_had_r_128_grouped_kernel<<<grid, 32, 0, stream>>>(
++        reinterpret_cast<const float*>(gate.data_ptr()), reinterpret_cast<const float*>(up.data_ptr()),
++        reinterpret_cast<half*>(output.data_ptr()), reinterpret_cast<const int*>(row_group.data_ptr()),
++        reinterpret_cast<const int64_t*>(scale_ptrs.data_ptr()), static_cast<float>(limit), static_cast<float>(alpha),
++        static_cast<int>(act), 0.088388347648f);
++    cuda_check(cudaPeekAtLastError());
++}
+diff --git a/csrc/exl3_fat_gemm.cuh b/csrc/exl3_fat_gemm.cuh
+index a82fca0..725f54f 100644
+--- a/csrc/exl3_fat_gemm.cuh
++++ b/csrc/exl3_fat_gemm.cuh
+@@ -30,3 +30,14 @@ void exl3_fat_gemm_scatter(
+     int64_t K,
+     bool mcg,
+     bool mul1);
++
++void exl3_fat_gemm_grouped(
++    at::Tensor a, at::Tensor packed_ptrs, at::Tensor out, at::Tensor svh_ptrs, at::Tensor row_bounds,
++    at::Tensor token_idx, at::Tensor route_weight, int64_t K, bool mcg, bool mul1, bool scatter,
++    int64_t size_n, int64_t max_rows);
++
++void exl3_had_r_128_grouped(at::Tensor input, at::Tensor output, at::Tensor row_group, at::Tensor scale_ptrs,
++                            at::Tensor gather);
++
++void exl3_act_had_r_128_grouped(at::Tensor gate, at::Tensor up, at::Tensor output, at::Tensor row_group,
++                                at::Tensor scale_ptrs, double limit, double alpha, int64_t act);
+diff --git a/csrc/exl3_fp8_prefill.cu b/csrc/exl3_fp8_prefill.cu
+new file mode 100644
+index 0000000..b9b2b0b
+--- /dev/null
++++ b/csrc/exl3_fp8_prefill.cu
+@@ -0,0 +1,247 @@
++// FP8 (e4m3) prefill path for dense EXL3 linears.
++//
++// LinearEXL3 computes y = had(had(x * suh) @ W) * svh, where W is the bare trellis
++// codebook matrix. The FP8 path keeps that rotated basis, because the input Hadamard
++// spreads activation outliers across the 128-wide block, so a per-row FP8 scale
++// fits well:
++//   1. exl3_had_quant_fp8_rows: xh = had(x * suh) per row (x fp16 or bf16), amax, xq = xh / s_row.
++//   2. exl3_fp16_to_fp8_t:      Wq^T = (W / s_w)^T in e4m3 ([N, K], column-major B).
++//   3. torch._scaled_mm(xq, Wq^T.t(), tensorwise scales) -> bf16 [M, N].
++//   4. exl3_had_rows_bf16:      y = had(acc * s_row * s_w) * svh, written fp32/bf16/fp16
++//                               into a (possibly column-sliced) output.
++// Tensorwise scaling in step 3 keeps cuBLASLt on its fast FP8 kernels on GB10;
++// rowwise scaling there selects a kernel ~3x slower at N >= 6144.
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <ATen/cuda/CUDAContext.h>
++
++#include "util.h"
++#include "util.cuh"
++#include "hadamard_inner.cuh"
++#include "exl3_fp8_prefill.cuh"
++
++namespace {
++
++constexpr float FP8_MAX = 448.0f;
++constexpr float HAD_R_SCALE = 0.088388347648f;  // 1 / sqrt(128)
++constexpr int QUANT_WARPS = 8;
++constexpr int QUANT_MAX_CHUNKS = 16;  // per warp: K <= 8 * 16 * 128 = 16384
++
++__device__ inline void had4x32(float& h0, float& h1, float& h2, float& h3, int lane)
++{
++    float s0 = h0 + h1, d0 = h0 - h1, s1 = h2 + h3, d1 = h2 - h3;
++    h0 = s0 + s1;
++    h1 = d0 + d1;
++    h2 = s0 - s1;
++    h3 = d0 - d1;
++    shuffle_had_f4x32(h0, h1, h2, h3, lane);
++}
++
++__device__ inline float2 load2(const half* p) { return __half22float2(*reinterpret_cast<const half2*>(p)); }
++__device__ inline float2 load2(const __nv_bfloat16* p)
++{
++    return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p));
++}
++
++// One block per row. Warp w owns the 128-wide chunks w, w + 8, ...
++template <typename TIn>
++__global__ __launch_bounds__(QUANT_WARPS * 32)
++void had_quant_fp8_rows_kernel(
++    const TIn* __restrict__ x,
++    const half* __restrict__ suh,
++    __nv_fp8_e4m3* __restrict__ out,
++    float* __restrict__ row_scale,
++    int cols)
++{
++    __shared__ float warp_max[QUANT_WARPS];
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x & 31;
++    const int chunks = cols / 128;
++    const size_t row_off = static_cast<size_t>(blockIdx.x) * cols;
++    float v[QUANT_MAX_CHUNKS][4];
++    float amax = 0.0f;
++
++    #pragma unroll
++    for (int c = 0; c < QUANT_MAX_CHUNKS; ++c)
++    {
++        const int chunk = warp + c * QUANT_WARPS;
++        if (chunk < chunks)
++        {
++            const int col = chunk * 128 + lane * 4;
++            const float2 x01 = load2(x + row_off + col), x23 = load2(x + row_off + col + 2);
++            const float2 s01 = load2(suh + col), s23 = load2(suh + col + 2);
++            float h0 = x01.x * s01.x, h1 = x01.y * s01.y, h2 = x23.x * s23.x, h3 = x23.y * s23.y;
++            had4x32(h0, h1, h2, h3, lane);
++            v[c][0] = h0 * HAD_R_SCALE;
++            v[c][1] = h1 * HAD_R_SCALE;
++            v[c][2] = h2 * HAD_R_SCALE;
++            v[c][3] = h3 * HAD_R_SCALE;
++            amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v[c][0]), fabsf(v[c][1])), fmaxf(fabsf(v[c][2]), fabsf(v[c][3]))));
++        }
++    }
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
++    if (lane == 0) warp_max[warp] = amax;
++    __syncthreads();
++    amax = warp_max[0];
++    #pragma unroll
++    for (int w = 1; w < QUANT_WARPS; ++w) amax = fmaxf(amax, warp_max[w]);
++    const float scale = fmaxf(amax, 1e-12f) / FP8_MAX;
++    const float inv = 1.0f / scale;
++    if (threadIdx.x == 0) row_scale[blockIdx.x] = scale;
++
++    #pragma unroll
++    for (int c = 0; c < QUANT_MAX_CHUNKS; ++c)
++    {
++        const int chunk = warp + c * QUANT_WARPS;
++        if (chunk < chunks)
++        {
++            const int col = chunk * 128 + lane * 4;
++            __nv_fp8x4_e4m3 q(make_float4(v[c][0] * inv, v[c][1] * inv, v[c][2] * inv, v[c][3] * inv));
++            *reinterpret_cast<__nv_fp8x4_e4m3*>(out + row_off + col) = q;
++        }
++    }
++}
++
++// [K, N] fp16 -> [N, K] e4m3 of w * inv_scale, through a 32x32 shared tile.
++__global__ __launch_bounds__(256)
++void fp16_to_fp8_t_kernel(
++    const half* __restrict__ w,
++    __nv_fp8_e4m3* __restrict__ out,
++    int size_k,
++    int size_n,
++    float inv_scale)
++{
++    __shared__ float tile[32][33];
++    const int n0 = blockIdx.x * 32, k0 = blockIdx.y * 32;
++    const int tx = threadIdx.x & 31, ty = threadIdx.x / 32;
++    #pragma unroll
++    for (int i = ty; i < 32; i += 8)
++        tile[i][tx] = __half2float(w[static_cast<size_t>(k0 + i) * size_n + n0 + tx]);
++    __syncthreads();
++    #pragma unroll
++    for (int i = ty; i < 32; i += 8)
++        out[static_cast<size_t>(n0 + i) * size_k + k0 + tx] = __nv_fp8_e4m3(tile[tx][i] * inv_scale);
++}
++
++__device__ inline void store4(float* p, float a, float b, float c, float d) { *reinterpret_cast<float4*>(p) = make_float4(a, b, c, d); }
++__device__ inline void store4(__nv_bfloat16* p, float a, float b, float c, float d)
++{
++    reinterpret_cast<__nv_bfloat162*>(p)[0] = __floats2bfloat162_rn(a, b);
++    reinterpret_cast<__nv_bfloat162*>(p)[1] = __floats2bfloat162_rn(c, d);
++}
++__device__ inline void store4(half* p, float a, float b, float c, float d)
++{
++    reinterpret_cast<half2*>(p)[0] = __floats2half2_rn(a, b);
++    reinterpret_cast<half2*>(p)[1] = __floats2half2_rn(c, d);
++}
++
++// y = had(acc * row_scale * w_scale) * svh, bf16 in. Grid (rows, cols / 128), one warp.
++// ``out`` rows are ``out_ld`` elements apart (a column slice of a wider output).
++template <typename TOut>
++__global__ __launch_bounds__(32)
++void had_rows_bf16_kernel(
++    const __nv_bfloat16* __restrict__ acc,
++    const float* __restrict__ row_scale,
++    const half* __restrict__ svh,
++    TOut* __restrict__ out,
++    int64_t out_ld,
++    float w_scale)
++{
++    const int lane = threadIdx.x;
++    const int col = blockIdx.y * 128 + lane * 4;
++    const size_t off = static_cast<size_t>(gridDim.y) * 128 * blockIdx.x + col;
++    const __nv_bfloat162* ap = reinterpret_cast<const __nv_bfloat162*>(acc + off);
++    float2 a = __bfloat1622float2(ap[0]);
++    float2 b = __bfloat1622float2(ap[1]);
++    float h0 = a.x, h1 = a.y, h2 = b.x, h3 = b.y;
++    had4x32(h0, h1, h2, h3, lane);
++    const float s = row_scale[blockIdx.x] * w_scale * HAD_R_SCALE;
++    const half2* sp = reinterpret_cast<const half2*>(svh + col);
++    float2 s01 = __half22float2(sp[0]);
++    float2 s23 = __half22float2(sp[1]);
++    store4(out + static_cast<size_t>(blockIdx.x) * out_ld + col, h0 * s * s01.x, h1 * s * s01.y, h2 * s * s23.x,
++           h3 * s * s23.y);
++}
++
++}  // namespace
++
++void exl3_had_quant_fp8_rows(at::Tensor x, at::Tensor suh, at::Tensor out, at::Tensor row_scale)
++{
++    TORCH_CHECK((x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) && x.is_contiguous() && x.dim() == 2,
++                "x contiguous float16/bfloat16 [M, K]");
++    const int64_t cols = x.size(1);
++    TORCH_CHECK(cols % 128 == 0 && cols <= QUANT_WARPS * QUANT_MAX_CHUNKS * 128, "K % 128 == 0 and K <= 16384");
++    TORCH_CHECK(suh.scalar_type() == at::kHalf && suh.numel() == cols, "suh float16 [K]");
++    TORCH_CHECK(out.scalar_type() == at::kFloat8_e4m3fn && out.is_contiguous() && out.sizes() == x.sizes(),
++                "out contiguous float8_e4m3fn like x");
++    TORCH_CHECK(row_scale.scalar_type() == at::kFloat && row_scale.numel() == x.size(0), "row_scale float32 [M]");
++    if (x.size(0) == 0) return;
++    const at::cuda::OptionalCUDAGuard device_guard(x.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    const int grid = static_cast<int>(x.size(0));
++    if (x.scalar_type() == at::kHalf)
++        had_quant_fp8_rows_kernel<half><<<grid, QUANT_WARPS * 32, 0, stream>>>(
++            reinterpret_cast<const half*>(x.data_ptr()), reinterpret_cast<const half*>(suh.data_ptr()),
++            reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()), row_scale.data_ptr<float>(), static_cast<int>(cols));
++    else
++        had_quant_fp8_rows_kernel<__nv_bfloat16><<<grid, QUANT_WARPS * 32, 0, stream>>>(
++            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const half*>(suh.data_ptr()),
++            reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()), row_scale.data_ptr<float>(), static_cast<int>(cols));
++    cuda_check(cudaPeekAtLastError());
++}
++
++void exl3_fp16_to_fp8_t(at::Tensor w, at::Tensor out, double inv_scale)
++{
++    TORCH_CHECK(w.scalar_type() == at::kHalf && w.is_contiguous() && w.dim() == 2, "w contiguous float16 [K, N]");
++    TORCH_CHECK(w.size(0) % 32 == 0 && w.size(1) % 32 == 0, "K, N % 32");
++    TORCH_CHECK(out.scalar_type() == at::kFloat8_e4m3fn && out.is_contiguous() && out.size(0) == w.size(1) &&
++                out.size(1) == w.size(0), "out contiguous float8_e4m3fn [N, K]");
++    const at::cuda::OptionalCUDAGuard device_guard(w.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    dim3 grid(static_cast<int>(w.size(1) / 32), static_cast<int>(w.size(0) / 32));
++    fp16_to_fp8_t_kernel<<<grid, 256, 0, stream>>>(
++        reinterpret_cast<const half*>(w.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(out.data_ptr()),
++        static_cast<int>(w.size(0)), static_cast<int>(w.size(1)), static_cast<float>(inv_scale));
++    cuda_check(cudaPeekAtLastError());
++}
++
++void exl3_had_rows_bf16(at::Tensor acc, at::Tensor row_scale, at::Tensor svh, at::Tensor out, double w_scale)
++{
++    TORCH_CHECK(acc.scalar_type() == at::kBFloat16 && acc.is_contiguous() && acc.dim() == 2 && acc.size(1) % 128 == 0,
++                "acc contiguous bfloat16 [M, 128*n]");
++    TORCH_CHECK(out.dim() == 2 && out.size(0) == acc.size(0) && out.size(1) == acc.size(1) && out.stride(1) == 1 &&
++                (out.stride(0) * out.element_size()) % 16 == 0 &&
++                reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0,
++                "out [M, N] with unit column stride and 16-byte aligned rows (may be a column slice)");
++    TORCH_CHECK(row_scale.scalar_type() == at::kFloat && row_scale.numel() == acc.size(0), "row_scale float32 [M]");
++    TORCH_CHECK(svh.scalar_type() == at::kHalf && svh.numel() == acc.size(1), "svh float16 [N]");
++    if (acc.size(0) == 0) return;
++    const at::cuda::OptionalCUDAGuard device_guard(acc.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    dim3 grid(static_cast<int>(acc.size(0)), static_cast<int>(acc.size(1) / 128));
++    const auto* a = reinterpret_cast<const __nv_bfloat16*>(acc.data_ptr());
++    const auto* sv = reinterpret_cast<const half*>(svh.data_ptr());
++    const float* rs = row_scale.data_ptr<float>();
++    const int64_t ld = out.stride(0);
++    const float ws = static_cast<float>(w_scale);
++    switch (out.scalar_type())
++    {
++        case at::kFloat:
++            had_rows_bf16_kernel<float><<<grid, 32, 0, stream>>>(a, rs, sv, out.data_ptr<float>(), ld, ws);
++            break;
++        case at::kBFloat16:
++            had_rows_bf16_kernel<__nv_bfloat16><<<grid, 32, 0, stream>>>(
++                a, rs, sv, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ld, ws);
++            break;
++        case at::kHalf:
++            had_rows_bf16_kernel<half><<<grid, 32, 0, stream>>>(a, rs, sv, reinterpret_cast<half*>(out.data_ptr()), ld, ws);
++            break;
++        default:
++            TORCH_CHECK(false, "out must be float32, bfloat16 or float16");
++    }
++    cuda_check(cudaPeekAtLastError());
++}
+diff --git a/csrc/exl3_fp8_prefill.cuh b/csrc/exl3_fp8_prefill.cuh
+new file mode 100644
+index 0000000..ee854be
+--- /dev/null
++++ b/csrc/exl3_fp8_prefill.cuh
+@@ -0,0 +1,6 @@
++#pragma once
++#include <ATen/Tensor.h>
++
++void exl3_had_quant_fp8_rows(at::Tensor x, at::Tensor suh, at::Tensor out, at::Tensor row_scale);
++void exl3_fp16_to_fp8_t(at::Tensor w, at::Tensor out, double inv_scale);
++void exl3_had_rows_bf16(at::Tensor acc, at::Tensor row_scale, at::Tensor svh, at::Tensor out, double w_scale);
+diff --git a/setup.py b/setup.py
+index 7a6e9f6..430abf3 100644
+--- a/setup.py
++++ b/setup.py
+@@ -73,6 +73,7 @@ if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
+                     _src("p2b_moe.cu"),
+                     _src("exl3_gemm.cu"),
+                     _src("exl3_fat_gemm.cu"),
++                    _src("exl3_fp8_prefill.cu"),
+                 ],
+                 include_dirs=include_dirs,
+                 extra_compile_args={
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index 46f2920..a503d15 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -3065,6 +3065,151 @@ def _fat_kernel_available() -> bool:
+     return bool(native_c and hasattr(native_c, "exl3_fat_gemm"))
+ 
+ 
++def _fat_grouped_available() -> bool:
++    native_c = _load_native_exl3_ext()
++    return bool(native_c and hasattr(native_c, "exl3_fat_gemm_grouped") and hasattr(native_c, "exl3_act_had_r_128_grouped"))
++
++
++def _fat_grouped_tables(layer: Any, inners: list[dict[str, Any]]) -> dict[str, Any] | None:
++    """Per-layer device pointer tables for the grouped fat path (built once).
++
++    Each expert's gate/up/down LinearEXL3 keeps its trellis, suh and svh in place
++    for the life of the engine (arena views), so their base pointers can be
++    tabulated once. Returns None when the layer does not fit the grouped kernels.
++    """
++    cached = getattr(layer, "_exl3_fat_grouped_tables", False)
++    if cached is not False:
++        return cached
++    tables = None
++    try:
++        dev = inners[0]["down"].trellis.device
++        gated = all(inn.get("gate") is not None for inn in inners)
++        if gated:
++            tables = {"shared_suh": all(
++                bool(inn.get("_exl3_gate_up_shared_suh", torch.equal(inn["gate"].suh, inn["up"].suh)))
++                for inn in inners
++            )}
++            for proj in ("gate", "up", "down"):
++                lins = [inn[proj] for inn in inners]
++                if not all(l.trellis.is_contiguous() and l.svh.is_contiguous() and l.suh.is_contiguous() for l in lins):
++                    raise ValueError(f"{proj}: non-contiguous expert tensors")
++                tables[proj] = {
++                    "trellis": torch.tensor([l.trellis.data_ptr() for l in lins], dtype=torch.int64, device=dev),
++                    "svh": torch.tensor([l.svh.data_ptr() for l in lins], dtype=torch.int64, device=dev),
++                    "suh": torch.tensor([l.suh.data_ptr() for l in lins], dtype=torch.int64, device=dev),
++                    "class": [(int(l.K), bool(l.mcg), bool(l.mul1)) for l in lins],
++                    "out": int(lins[0].out_features),
++                }
++            # Grouped GEMM tiles: N in 128s, K in 64-wide pipeline stages.
++            in_features = int(inners[0]["gate"].trellis.shape[0]) * 16
++            if tables["gate"]["out"] % 128 or tables["down"]["out"] % 128 or in_features % 64 or tables["gate"]["out"] % 64:
++                tables = None
++    except Exception as exc:  # never break a forward over an optional fast path
++        logger.warning("EXL3 grouped fat path unavailable for this layer: %r", exc)
++        tables = None
++    layer._exl3_fat_grouped_tables = tables
++    return tables
++
++
++def apply_exl3_grouped_fat(
++    xh: torch.Tensor,
++    token_sorted: torch.Tensor,
++    weight_sorted: torch.Tensor,
++    counts_host: list[int],
++    tables: dict[str, Any],
++    limit: float | None,
++    cap: int,
++    out: torch.Tensor,
++    moe_act: int,
++) -> torch.Tensor:
++    """All fat experts of one layer in a handful of launches.
++
++    Rows are already sorted by expert (``token_sorted``/``weight_sorted``). The
++    fat experts' rows are gathered once; gate/up inputs get their per-expert
++    input Hadamard in one grouped launch each; gate, up and down run as one
++    fused dequant+MMA launch per (K, codebook) class; the activation runs once
++    over all rows; down scatters (atomically) into ``out``. Same math as
++    apply_exl3_batched_fat, without ~13 small launches per expert.
++    """
++    native_c = _load_native_exl3_ext()
++    dev = xh.device
++    fat, spans, offset = [], [], 0
++    for e, n in enumerate(counts_host):
++        if n > cap:
++            fat.append(e)
++            spans.append((offset, n))
++        offset += n
++    if not fat:
++        return out
++    global _FAT_LOGGED
++    if not _FAT_LOGGED:
++        _FAT_LOGGED = True
++        logger.info("EXL3 fat expert path ACTIVE (grouped; first layer: %d fat experts, cap=%d)" % (len(fat), cap))
++    counts = [n for _, n in spans]
++    pos = torch.cat([torch.arange(s, s + n, dtype=torch.long) for s, n in spans]).to(dev, non_blocking=True)
++    tok = token_sorted.index_select(0, pos).contiguous()
++    wts = weight_sorted.index_select(0, pos).to(torch.float16).contiguous()
++    rows = int(pos.numel())
++    fat_t = torch.tensor(fat, dtype=torch.long).to(dev, non_blocking=True)
++    row_group = torch.repeat_interleave(
++        torch.arange(len(fat), dtype=torch.int32), torch.tensor(counts, dtype=torch.long)
++    ).to(dev, non_blocking=True)
++    starts = [0]
++    for n in counts:
++        starts.append(starts[-1] + n)
++
++    def run(proj: str, a: torch.Tensor, dst: torch.Tensor, scatter: bool) -> None:
++        t = tables[proj]
++        classes: dict[tuple[int, bool, bool], list[int]] = {}
++        for gi, e in enumerate(fat):
++            classes.setdefault(t["class"][e], []).append(gi)
++        for (k, mcg, mul1), members in classes.items():
++            sel = torch.tensor([fat[g] for g in members], dtype=torch.long).to(dev, non_blocking=True)
++            bounds = torch.tensor(
++                [b for g in members for b in (starts[g], starts[g + 1])], dtype=torch.int32
++            ).to(dev, non_blocking=True)
++            native_c.exl3_fat_gemm_grouped(
++                a, t["trellis"].index_select(0, sel), dst, t["svh"].index_select(0, sel), bounds,
++                tok if scatter else torch.empty(0, dtype=torch.long, device=dev),
++                wts if scatter else torch.empty(0, dtype=torch.float16, device=dev),
++                k, mcg, mul1, scatter, t["out"], max(counts[g] for g in members),
++            )
++
++    if moe_act == MOE_ACT_SWIGLU_OAI:
++        act_kind = 1
++    elif moe_act == MOE_ACT_SILU:
++        act_kind = 0
++    else:
++        raise ValueError(f"EXL3 grouped fat path has no implementation for activation {moe_act}")
++    # Gather + input Hadamard in one pass per distinct suh.
++    gate_in = torch.empty(rows, xh.shape[1], dtype=torch.float16, device=dev)
++    native_c.exl3_had_r_128_grouped(xh, gate_in, row_group, tables["gate"]["suh"].index_select(0, fat_t), tok)
++    if tables["shared_suh"]:
++        up_in = gate_in
++    else:
++        up_in = torch.empty_like(gate_in)
++        native_c.exl3_had_r_128_grouped(xh, up_in, row_group, tables["up"]["suh"].index_select(0, fat_t), tok)
++    inter = tables["gate"]["out"]
++    gate_out = torch.empty(rows, inter, dtype=torch.float32, device=dev)
++    up_out = torch.empty(rows, inter, dtype=torch.float32, device=dev)
++    run("gate", gate_in, gate_out, False)
++    run("up", up_in, up_out, False)
++    # Clamp + activation + fp16 round + down-input Hadamard in one pass.
++    down_in = torch.empty(rows, inter, dtype=torch.float16, device=dev)
++    native_c.exl3_act_had_r_128_grouped(
++        gate_out, up_out, down_in, row_group, tables["down"]["suh"].index_select(0, fat_t),
++        float(limit) if limit is not None and limit > 0 else 0.0, MINIMAX_SWIGLU_ALPHA_DEFAULT, act_kind,
++    )
++    run("down", down_in, out, True)
++    return out
++
++def _fat_grouped_ok(layer: Any, inners: list[dict[str, Any]]) -> bool:
++    """Grouped fat kernels present (patched vllm_exl3_c), enabled, and the layer fits them."""
++    if os.environ.get("VLLM_EXL3_FAT_GROUPED", "1") == "0" or not _fat_grouped_available():
++        return False
++    return _fat_grouped_tables(layer, inners) is not None
++
++
+ def apply_exl3_batched_fat(
+     xh: torch.Tensor,
+     token_sorted: torch.Tensor,
+@@ -3714,18 +3859,31 @@ def apply_exl3_fused_moe(
+         layer._exl3_last_apply = (
+             (layer._exl3_last_apply or "fused") + "+fat"
+         )
+-        apply_exl3_batched_fat(
+-            xh,
+-            flat_token[fat_order],
+-            flat_weight[fat_order],
+-            counts.tolist(),
+-            inners,
+-            limit,
+-            FAT_EXPERT_THRESHOLD,
+-            out,
+-            use_kernel=_fat_kernel_available(),
+-            moe_act=moe_act,
+-        )
++        if _fat_grouped_ok(layer, inners):
++            apply_exl3_grouped_fat(
++                xh,
++                flat_token[fat_order],
++                flat_weight[fat_order],
++                counts.tolist(),
++                _fat_grouped_tables(layer, inners),
++                limit,
++                FAT_EXPERT_THRESHOLD,
++                out,
++                moe_act,
++            )
++        else:
++            apply_exl3_batched_fat(
++                xh,
++                flat_token[fat_order],
++                flat_weight[fat_order],
++                counts.tolist(),
++                inners,
++                limit,
++                FAT_EXPERT_THRESHOLD,
++                out,
++                use_kernel=_fat_kernel_available(),
++                moe_act=moe_act,
++            )
+     return out
+ 
+ 
+@@ -5929,6 +6087,70 @@ def _env_int(name: str, default: int) -> int:
+ 
+ _EXL3_RECON_MIN_ROWS = _env_int("VLLM_EXL3_RECONSTRUCT_MIN_ROWS", 17)
+ _EXL3_COOP_GEMM = os.environ.get("VLLM_EXL3_COOP_GEMM", "").strip() in ("1", "true", "yes")
++# FP8 (e4m3) dense prefill: layers with rows >= VLLM_EXL3_FP8_PREFILL_MIN_ROWS run the
++# rotated-basis FP8 path (Exl3LinearMethod._apply_fp8_layer). Off unless VLLM_EXL3_FP8_PREFILL=1.
++_EXL3_FP8_PREFILL = os.environ.get("VLLM_EXL3_FP8_PREFILL", "").strip() in ("1", "true", "yes")
++_EXL3_FP8_MIN_ROWS = _env_int("VLLM_EXL3_FP8_PREFILL_MIN_ROWS", 1024)
++_EXL3_FP8_MAX_N = 16384
++# Layers whose prefix matches this regex keep the fp16 path (e.g. "self_attn").
++_EXL3_FP8_SKIP = re.compile(os.environ["VLLM_EXL3_FP8_PREFILL_SKIP"]) if os.environ.get("VLLM_EXL3_FP8_PREFILL_SKIP") else None
++
++
++def _fp8_eligible(linear) -> bool:
++    """Shapes the FP8 kernels take (csrc/exl3_fp8_prefill.cu)."""
++    k, n = int(linear.in_features), int(linear.out_features)
++    return not (k % 128 or n % 128 or k > 16384 or n > _EXL3_FP8_MAX_N or getattr(linear, "suh", None) is None)
++
++
++def _fp8_kernels_available() -> bool:
++    native_c = _load_native_exl3_ext()
++    return bool(native_c is not None and hasattr(native_c, "exl3_had_rows_bf16"))
++
++
++def _dense_forward_fp8(linear, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
++    """FP8 prefill for one dense EXL3 linear (caller checks _fp8_eligible/_fp8_kernels_available).
++
++    Keeps LinearEXL3's rotated basis: per-row FP8 of had(x * suh) (x fp16 or bf16), a
++    per-tensor FP8 copy of the bare trellis weight, a tensorwise-scaled FP8 GEMM (bf16
++    out), then the row/weight rescale and output Hadamard with svh, written into ``out``
++    (fp32/bf16/fp16, may be a column slice) or a new fp32 tensor. The weight's FP8
++    scale is measured once per linear from its reconstruction.
++    """
++    native_c = _load_native_exl3_ext()
++    ext = load_exllamav3_ext()
++    k, n = int(linear.in_features), int(linear.out_features)
++    dev = x.device
++    rows = int(x.shape[0])
++    w = torch.empty((k, n), dtype=torch.half, device=dev)
++    ext.reconstruct(w, linear.trellis, linear.K, linear.mcg, linear.mul1)
++    w_scale = linear.__dict__.get("_exl3_fp8_w_scale")
++    if w_scale is None:
++        w_scale = max(float(w.abs().amax().item()), 1e-6) / 448.0
++        linear._exl3_fp8_w_scale = w_scale
++    wq = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=dev)
++    native_c.exl3_fp16_to_fp8_t(w, wq, 1.0 / w_scale)
++    del w
++    xq = torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=dev)
++    row_scale = torch.empty((rows,), dtype=torch.float32, device=dev)
++    native_c.exl3_had_quant_fp8_rows(x, linear.suh, xq, row_scale)
++    one = _fp8_unit_scale(dev)
++    acc = torch._scaled_mm(xq, wq.t(), scale_a=one, scale_b=one, out_dtype=torch.bfloat16)
++    del xq, wq
++    y = out if out is not None else torch.empty((rows, n), dtype=torch.float32, device=dev)
++    native_c.exl3_had_rows_bf16(acc, row_scale, linear.svh, y, w_scale)
++    if linear.bias is not None:
++        y += linear.bias
++    return y
++
++
++_FP8_UNIT: dict[torch.device, torch.Tensor] = {}
++
++
++def _fp8_unit_scale(dev: torch.device) -> torch.Tensor:
++    t = _FP8_UNIT.get(dev)
++    if t is None:
++        t = _FP8_UNIT[dev] = torch.ones((), dtype=torch.float32, device=dev)
++    return t
+ 
+ 
+ def _dense_forward(linear, x_fp16: torch.Tensor) -> torch.Tensor:
+@@ -6801,6 +7023,70 @@ class Exl3LinearMethod(LinearMethodBase):
+             y = _lm_head_rank_slice(layer, y)
+         return y
+ 
++    def _apply_fp8_layer(self, layer, linears, x_2d: torch.Tensor) -> torch.Tensor | None:
++        """FP8 prefill of a whole fused layer, or None to use the fp16 path.
++
++        Every EXL3 shard runs _dense_forward_fp8 on the bf16/fp16 input directly and
++        writes its output into its column slice of one output in the input dtype, so
++        the fp16 input copy, per-shard fp32 outputs, the cat and the final cast are
++        gone. Indexer (MXFP8) and BF16 shards run as before and are copied into
++        their slices.
++        """
++        rows = int(x_2d.shape[0])
++        if not (_EXL3_FP8_PREFILL and rows >= _EXL3_FP8_MIN_ROWS and x_2d.dtype in (torch.bfloat16, torch.float16)):
++            return None
++        plan = layer.__dict__.get("_exl3_fp8_plan", False)
++        if plan is False:
++            plan = None
++            sizes = list(layer._exl3_linear_output_partition_sizes)
++            bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
++            indexer_ids = getattr(layer, "_exl3_indexer_shards", ())
++            mxfp8 = getattr(layer, "_exl3_indexer_mxfp8", None)
++            ok = (
++                _fp8_kernels_available()
++                and not (_EXL3_FP8_SKIP is not None and _EXL3_FP8_SKIP.search(str(getattr(layer, "prefix", ""))))
++                and not getattr(layer, "_exl3_linear_padded", False)
++                and len(sizes) == len(linears)
++            )
++            offsets, offset = [], 0
++            for i, linear in enumerate(linears):
++                offsets.append(offset)
++                exl3_shard = not (mxfp8 is not None and i in indexer_ids) and i not in bf16_shards
++                if exl3_shard and (
++                    linear is None
++                    or not _fp8_eligible(linear)
++                    or int(linear.out_features) != int(sizes[i])
++                    or offset % 8
++                ):
++                    ok = False
++                offset += int(sizes[i])
++            if ok:
++                plan = (offsets, offset)
++            layer._exl3_fp8_plan = plan
++            logger.info("EXL3 FP8 prefill %s: %s", "ON" if plan else "off", getattr(layer, "prefix", "?"))
++        if plan is None:
++            return None
++        offsets, total = plan
++        x_in = x_2d.contiguous()
++        y = torch.empty((rows, total), dtype=x_2d.dtype, device=x_2d.device)
++        bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
++        bf16_weight = getattr(layer, "_exl3_bf16_weight", None)
++        sizes = layer._exl3_linear_output_partition_sizes
++        indexer_mxfp8 = getattr(layer, "_exl3_indexer_mxfp8", None)
++        indexer_ids = getattr(layer, "_exl3_indexer_shards", ())
++        for i, linear in enumerate(linears):
++            dst = y[:, offsets[i] : offsets[i] + int(sizes[i])]
++            if indexer_mxfp8 is not None and i in indexer_ids:
++                kernel, shim = indexer_mxfp8[indexer_ids.index(i)]
++                dst.copy_(kernel.apply_weights(shim, x_2d))
++            elif i in bf16_shards:
++                b = bf16_shards.index(i)
++                start = sum(int(sizes[j]) for j in bf16_shards[:b])
++                dst.copy_(F.linear(x_2d, bf16_weight[start : start + int(sizes[i])]))
++            else:
++                _dense_forward_fp8(linear, x_in, out=dst)
++        return y
++
+     def _apply_impl(self, layer, x: torch.Tensor) -> torch.Tensor:
+         linears = getattr(layer, "_exl3_linears", None)
+         if _EXL3_PREFILL_SYNC:
+@@ -6820,6 +7106,12 @@ class Exl3LinearMethod(LinearMethodBase):
+         else:
+             x_2d = x
+ 
++        y = self._apply_fp8_layer(layer, linears, x_2d)
++        if y is not None:
++            if len(orig_shape) > 2:
++                y = y.reshape(*orig_shape[:-1], y.shape[-1])
++            return y
++
+         # Cast to contiguous fp16 for EXL3 shards
+         x_fp16 = x_2d.to(torch.float16).contiguous()
+         if getattr(layer, "_exl3_linear_padded", False):
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index e928dcb..789b99c 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -58,6 +58,8 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_MOE_TEMP_ROWS", "VLLM_EXL3_FAT_THRESHOLD", "VLLM_EXL3_PERIODIC_TRIM_S",
+     "VLLM_EXL3_MIXEDK_MODE", "VLLM_EXL3_PREFILL_SYNC", "VLLM_EXL3_RECONSTRUCT_MIN_ROWS",
+     "VLLM_EXL3_MOE_LPT", "VLLM_EXL3_COOP", "VLLM_EXL3_COOP_GEMM",
++    "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
++    "VLLM_EXL3_FP8_PREFILL_SKIP",
+ })
+ 
+ try:
+diff --git a/tests/gpu/bench_fat_gemm.py b/tests/gpu/bench_fat_gemm.py
+new file mode 100644
+index 0000000..1c8e204
+--- /dev/null
++++ b/tests/gpu/bench_fat_gemm.py
+@@ -0,0 +1,22 @@
++import torch, time
++import vllm_exl3_c as nat
++from exllamav3.ext import exllamav3_ext as ext
++dev = "cuda"
++def bench(fn, n=10):
++    fn(); torch.cuda.synchronize(); t = time.time()
++    for _ in range(n): fn()
++    torch.cuda.synchronize(); return (time.time() - t) / n * 1e3
++for (M, IN, OUT, K) in ((16384, 3072, 4096, 3), (16384, 4096, 3072, 3), (16384, 3072, 1536, 2), (512, 3072, 1536, 2), (512, 1536, 3072, 3)):
++    a = (torch.randn(M, IN, device=dev) * 0.5).half()
++    tr = torch.randint(-32768, 32767, (IN // 16, OUT // 16, 16 * K), dtype=torch.int16, device=dev)
++    svh = (torch.rand(OUT, device=dev) + 0.5).half()
++    w = torch.empty(IN, OUT, dtype=torch.half, device=dev)
++    o16 = torch.empty(M, OUT, dtype=torch.half, device=dev)
++    o32 = torch.empty(M, OUT, dtype=torch.float32, device=dev)
++    def recon():
++        ext.reconstruct(w, tr, K, True, False); ext.hgemm(a, w, o16); ext.had_r_128(o16, o16, None, svh, 1.0)
++    def fused():
++        nat.exl3_fat_gemm(a, tr, o32, svh, K, True, False)
++    t1, t2 = bench(recon), bench(fused)
++    tf = 2 * M * IN * OUT / 1e12
++    print(f"M={M:5} {IN}x{OUT} K{K}: reconstruct+hgemm+had {t1:7.2f} ms ({tf/t1*1e3:5.1f} TFLOPS) | fused {t2:7.2f} ms ({tf/t2*1e3:5.1f} TFLOPS)")
+diff --git a/tests/gpu/bench_fp8_dense.py b/tests/gpu/bench_fp8_dense.py
+new file mode 100644
+index 0000000..9a6d104
+--- /dev/null
++++ b/tests/gpu/bench_fp8_dense.py
+@@ -0,0 +1,55 @@
++"""FP8 (e4m3) vs FP16 GEMM throughput and error on GB10 at the 2.15 lane's per-rank prefill shapes.
++
++fp16: torch.matmul (cuBLAS hgemm, fp32 accumulate), the dense prefill path today.
++fp8:  torch._scaled_mm with per-token activation scales and per-channel weight scales,
++      including the activation quantization (amax + cast) in the timing.
++"""
++import time
++
++import torch
++
++dev = "cuda"
++torch.manual_seed(0)
++print(torch.__version__, torch.cuda.get_device_name(), torch.cuda.get_device_capability())
++F8 = torch.float8_e4m3fn
++F8_MAX = torch.finfo(F8).max
++
++
++def timeit(fn, n=20):
++    fn()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(n):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t) / n * 1e3
++
++
++def quant_rows(x):
++    s = x.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-8) / F8_MAX
++    return (x.float() / s).to(F8), s
++
++
++for m in (8192, 16384):
++    for k, n in ((6144, 3072), (3072, 6144), (6144, 12288), (6144, 6144)):
++        a = torch.randn(m, k, device=dev, dtype=torch.float16)
++        w = torch.randn(k, n, device=dev, dtype=torch.float16) * 0.02
++        flops = 2 * m * k * n
++        t16 = timeit(lambda: a @ w)
++        ref = (a @ w).float()
++        wq_t, ws = quant_rows(w.t().contiguous())  # per output channel
++        wq = wq_t.t()  # column-major [k, n]
++
++        def fp8():
++            aq, as_ = quant_rows(a)
++            return torch._scaled_mm(aq, wq, scale_a=as_, scale_b=ws.t(), out_dtype=torch.bfloat16)
++
++        try:
++            t8 = timeit(fp8)
++            aq, as_ = quant_rows(a)
++            t8_mm = timeit(lambda: torch._scaled_mm(aq, wq, scale_a=as_, scale_b=ws.t(), out_dtype=torch.bfloat16))
++            err = ((fp8().float() - ref).norm() / ref.norm()).item()
++            print(f"M={m} {k}->{n}: fp16 {t16:.2f} ms ({flops / t16 / 1e9:.0f} TF) | fp8 {t8:.2f} ms incl quant, "
++                  f"{t8_mm:.2f} ms gemm ({flops / t8_mm / 1e9:.0f} TF) | fp8 rel err {err:.1e}")
++        except Exception as exc:
++            print(f"M={m} {k}->{n}: fp16 {t16:.2f} ms ({flops / t16 / 1e9:.0f} TF) | fp8 FAILED {exc!r}"[:300])
+diff --git a/tests/gpu/bench_fp8_variants.py b/tests/gpu/bench_fp8_variants.py
+new file mode 100644
+index 0000000..159d32f
+--- /dev/null
++++ b/tests/gpu/bench_fp8_variants.py
+@@ -0,0 +1,52 @@
++"""Which torch._scaled_mm configuration gets GB10's fast FP8 kernels at the dense prefill shapes.
++
++Tensorwise scales (row scales are applied later in the output Hadamard), fp32/fp16/bf16 out,
++and N sliced into 3072-wide chunks written through out= views.
++"""
++import time
++
++import torch
++
++dev = "cuda"
++F8 = torch.float8_e4m3fn
++one = torch.tensor(1.0, device=dev)
++
++
++def timeit(fn, n=20):
++    fn()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(n):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t) / n * 1e3
++
++
++m = 8192
++for k, n in ((6144, 3072), (3072, 6144), (6144, 6144), (6144, 12288)):
++    a = torch.randn(m, k, device=dev).to(F8)
++    w = torch.randn(n, k, device=dev).to(F8)  # [n, k] contiguous -> w.t() is column-major [k, n]
++    flops = 2 * m * k * n
++    res = []
++    for dt in (torch.float32, torch.float16, torch.bfloat16):
++        try:
++            t = timeit(lambda: torch._scaled_mm(a, w.t(), scale_a=one, scale_b=one, out_dtype=dt))
++            res.append(f"{str(dt)[6:]} {flops / t / 1e9:.0f}")
++        except Exception as exc:
++            res.append(f"{str(dt)[6:]} ERR {str(exc)[:60]}")
++    for chunk in (3072, 2048, 1536):
++        if n <= chunk:
++            continue
++        out = torch.empty(m, n, device=dev, dtype=torch.float32)
++
++        def sliced():
++            for s in range(0, n, chunk):
++                torch._scaled_mm(a, w[s:s + chunk].t(), scale_a=one, scale_b=one, out_dtype=torch.float32,
++                                 out=out[:, s:s + chunk])
++
++        try:
++            t = timeit(sliced)
++            res.append(f"fp32 sliced{chunk} {flops / t / 1e9:.0f}")
++        except Exception as exc:
++            res.append(f"sliced{chunk} ERR {str(exc)[:80]}")
++    print(f"M={m} {k}->{n} TFLOPS: " + " | ".join(res))
+diff --git a/tests/gpu/test_fat_gemm_any_k.py b/tests/gpu/test_fat_gemm_any_k.py
+new file mode 100644
+index 0000000..51eebdd
+--- /dev/null
++++ b/tests/gpu/test_fat_gemm_any_k.py
+@@ -0,0 +1,33 @@
++import torch, sys
++import vllm_exl3_c as nat
++from exllamav3.ext import exllamav3_ext as ext
++torch.manual_seed(0)
++print("EXL3_FAT_GEMM_MAX_K", nat.EXL3_FAT_GEMM_MAX_K)
++dev = "cuda"
++fails = 0
++for K in (2, 3, 4, 5):
++    for mcg, mul1 in ((True, False), (False, True), (False, False)):
++        M, IN, OUT = 300, 3072, 768
++        a = (torch.randn(M, IN, device=dev) * 0.5).half()
++        tr = torch.randint(-32768, 32767, (IN // 16, OUT // 16, 16 * K), dtype=torch.int16, device=dev)
++        svh = (torch.rand(OUT, device=dev) + 0.5).half()
++        w = torch.empty(IN, OUT, dtype=torch.half, device=dev)
++        ext.reconstruct(w, tr, K, mcg, mul1)
++        ref = torch.empty(M, OUT, dtype=torch.half, device=dev)
++        ext.hgemm(a, w, ref)
++        ref32 = ref.float().contiguous()
++        ext.had_r_128(ref32, ref32, None, svh, 1.0)
++        out = torch.empty(M, OUT, dtype=torch.float32, device=dev)
++        nat.exl3_fat_gemm(a, tr, out, svh, K, mcg, mul1)
++        rel = ((out - ref32).norm() / ref32.norm()).item()
++        # scatter variant
++        idx = torch.randperm(M, device=dev).long()
++        wt = (torch.rand(M, device=dev)).half()
++        sc = torch.zeros(M, OUT, dtype=torch.float32, device=dev)
++        nat.exl3_fat_gemm_scatter(a, tr, sc, svh, idx, wt, K, mcg, mul1)
++        ref_sc = torch.zeros_like(sc); ref_sc.index_add_(0, idx, ref32 * wt.float().unsqueeze(1))
++        rel_sc = ((sc - ref_sc).norm() / ref_sc.norm()).item()
++        ok = rel < 1e-2 and rel_sc < 1e-2
++        fails += not ok
++        print(f"K={K} mcg={mcg} mul1={mul1}: gemm rel err {rel:.2e}, scatter rel err {rel_sc:.2e} {'OK' if ok else 'FAIL'}")
++sys.exit(1 if fails else 0)
+diff --git a/tests/gpu/test_fat_gemm_grouped.py b/tests/gpu/test_fat_gemm_grouped.py
+new file mode 100644
+index 0000000..0e3a5bb
+--- /dev/null
++++ b/tests/gpu/test_fat_gemm_grouped.py
+@@ -0,0 +1,205 @@
++"""Grouped fat kernels vs the per-expert native kernels (run inside the image, on a GPU).
++
++exl3_fat_gemm_grouped must equal one exl3_fat_gemm call per expert on that expert's row
++span, and its scatter variant must equal per-expert scatters into a shared output where
++experts share tokens. exl3_had_r_128_grouped must equal exllamav3 had_r_128 with each
++row's expert pre-scale. Then times the per-expert loop against one grouped launch on the
++2.15 lane's per-rank shapes.
++"""
++import sys
++import time
++
++import torch
++import vllm_exl3_c as nat
++from exllamav3.ext import exllamav3_ext as ext
++
++torch.manual_seed(0)
++dev = "cuda"
++fails = 0
++
++
++def rel(x, y):
++    return ((x - y).norm() / y.norm()).item()
++
++
++def experts(n, size_in, size_out, k):
++    tr = [torch.randint(-32768, 32767, (size_in // 16, size_out // 16, 16 * k), dtype=torch.int16, device=dev)
++          for _ in range(n)]
++    svh = [(torch.rand(size_out, device=dev) + 0.5).half() for _ in range(n)]
++    return tr, svh
++
++
++def ptrs(ts):
++    return torch.tensor([t.data_ptr() for t in ts], dtype=torch.int64, device=dev)
++
++
++for k, mcg, mul1 in ((2, False, False), (3, True, False), (4, False, True), (5, False, False)):
++    counts = [300, 1, 0, 129, 64, 257]
++    size_in, size_out = 1024, 768
++    rows = sum(counts)
++    a = (torch.randn(rows, size_in, device=dev) * 0.5).half()
++    tr, svh = experts(len(counts), size_in, size_out, k)
++    starts = [0]
++    for n in counts:
++        starts.append(starts[-1] + n)
++    bounds = torch.tensor([b for g in range(len(counts)) for b in (starts[g], starts[g + 1])],
++                          dtype=torch.int32, device=dev)
++    ref = torch.zeros(rows, size_out, dtype=torch.float32, device=dev)
++    for g, n in enumerate(counts):
++        if n:
++            nat.exl3_fat_gemm(a[starts[g]:starts[g + 1]].contiguous(), tr[g], ref[starts[g]:starts[g + 1]], svh[g],
++                              k, mcg, mul1)
++    out = torch.zeros_like(ref)
++    empty_l = torch.empty(0, dtype=torch.long, device=dev)
++    empty_h = torch.empty(0, dtype=torch.float16, device=dev)
++    nat.exl3_fat_gemm_grouped(a, ptrs(tr), out, ptrs(svh), bounds, empty_l, empty_h, k, mcg, mul1, False,
++                              size_out, max(counts))
++    r_gemm = rel(out, ref)
++    # Scatter: 200 tokens, each expert's rows pick distinct tokens, experts overlap.
++    tokens = 400
++    tok = torch.cat([torch.randperm(tokens, device=dev)[:n] for n in counts]).long()
++    wts = torch.rand(rows, device=dev).half()
++    ref_sc = torch.zeros(tokens, size_out, dtype=torch.float32, device=dev)
++    for g, n in enumerate(counts):
++        if n:
++            s, e = starts[g], starts[g + 1]
++            nat.exl3_fat_gemm_scatter(a[s:e].contiguous(), tr[g], ref_sc, svh[g], tok[s:e].contiguous(),
++                                      wts[s:e].contiguous(), k, mcg, mul1)
++    sc = torch.zeros_like(ref_sc)
++    nat.exl3_fat_gemm_grouped(a, ptrs(tr), sc, ptrs(svh), bounds, tok, wts, k, mcg, mul1, True, size_out,
++                              max(counts))
++    r_sc = rel(sc, ref_sc)
++    ok = r_gemm < 1e-5 and r_sc < 1e-4
++    fails += not ok
++    print(f"K={k} mcg={mcg} mul1={mul1}: grouped gemm rel {r_gemm:.1e}, grouped scatter rel {r_sc:.1e} "
++          f"{'OK' if ok else 'FAIL'}")
++
++# Real per-rank shapes with skewed loads: gate (6144 -> 1536) and down (1536 -> 6144, scatter).
++for size_in, size_out, k, scatter in ((6144, 1536, 2, False), (1536, 6144, 3, True)):
++    counts = [2000, 65, 300, 1, 129, 700]
++    rows = sum(counts)
++    a = (torch.randn(rows, size_in, device=dev) * 0.5).half()
++    tr, svh = experts(len(counts), size_in, size_out, k)
++    starts = [0]
++    for n in counts:
++        starts.append(starts[-1] + n)
++    bounds = torch.tensor([b for g in range(len(counts)) for b in (starts[g], starts[g + 1])],
++                          dtype=torch.int32, device=dev)
++    tokens = 2048
++    tok = torch.cat([torch.randperm(tokens, device=dev)[:n] for n in counts]).long()
++    wts = torch.rand(rows, device=dev).half()
++    ref = torch.zeros(tokens if scatter else rows, size_out, dtype=torch.float32, device=dev)
++    for g, n in enumerate(counts):
++        s0, e0 = starts[g], starts[g + 1]
++        if scatter:
++            nat.exl3_fat_gemm_scatter(a[s0:e0].contiguous(), tr[g], ref, svh[g], tok[s0:e0].contiguous(),
++                                      wts[s0:e0].contiguous(), k, False, False)
++        else:
++            nat.exl3_fat_gemm(a[s0:e0].contiguous(), tr[g], ref[s0:e0], svh[g], k, False, False)
++    out = torch.zeros_like(ref)
++    nat.exl3_fat_gemm_grouped(a, ptrs(tr), out, ptrs(svh), bounds, tok if scatter else empty_l,
++                              wts if scatter else empty_h, k, False, False, scatter, size_out, max(counts))
++    r = rel(out, ref)
++    # Independent reference for the biggest expert: reconstruct + hgemm + output Hadamard.
++    w = torch.empty(size_in, size_out, dtype=torch.half, device=dev)
++    ext.reconstruct(w, tr[0], k, False, False)
++    r0 = torch.empty(counts[0], size_out, dtype=torch.half, device=dev)
++    ext.hgemm(a[:counts[0]].contiguous(), w, r0)
++    r0 = r0.float().contiguous()
++    ext.had_r_128(r0, r0, None, svh[0], 1.0)
++    if scatter:
++        mine = torch.zeros(tokens, size_out, dtype=torch.float32, device=dev)
++        nat.exl3_fat_gemm_grouped(a, ptrs(tr[:1]), mine, ptrs(svh[:1]), bounds[:2], tok, wts, k, False, False,
++                                  True, size_out, counts[0])
++        ref0 = torch.zeros_like(mine)
++        ref0.index_add_(0, tok[:counts[0]], r0 * wts[:counts[0]].float().unsqueeze(1))
++    else:
++        mine, ref0 = out[:counts[0]], r0
++    r_ind = rel(mine, ref0)
++    ok = r < 1e-4 and r_ind < 1e-2
++    fails += not ok
++    print(f"{size_in}->{size_out} K={k} scatter={scatter} skewed: grouped vs per-expert {r:.1e}, "
++          f"vs reconstruct ref {r_ind:.1e} {'OK' if ok else 'FAIL'}")
++
++# Grouped Hadamard
++counts = [5, 0, 17, 3]
++cols = 1024
++x = torch.randn(sum(counts), cols, device=dev).half()
++scales = [(torch.rand(cols, device=dev) + 0.5).half() for _ in counts]
++row_group = torch.repeat_interleave(torch.arange(len(counts), dtype=torch.int32, device=dev),
++                                    torch.tensor(counts, device=dev))
++y = torch.empty_like(x)
++nat.exl3_had_r_128_grouped(x, y, row_group, ptrs(scales), empty_l)
++ref = torch.empty_like(x)
++s = 0
++for g, n in enumerate(counts):
++    if n:
++        ext.had_r_128(x[s:s + n].contiguous(), ref[s:s + n], scales[g], None, 1.0)
++    s += n
++r_had = rel(y.float(), ref.float())
++# Fused gather: output row r reads source row gather[r].
++src = torch.randn(64, cols, device=dev).half()
++gather = torch.randint(0, 64, (x.shape[0],), device=dev).long()
++yg = torch.empty_like(x)
++nat.exl3_had_r_128_grouped(src, yg, row_group, ptrs(scales), gather)
++refg = torch.empty_like(x)
++nat.exl3_had_r_128_grouped(src.index_select(0, gather).contiguous(), refg, row_group, ptrs(scales), empty_l)
++r_gather = rel(yg.float(), refg.float())
++ok = r_had < 1e-6 and r_gather == 0.0
++fails += not ok
++print(f"grouped had rel {r_had:.1e}, gathered had rel {r_gather:.1e} {'OK' if ok else 'FAIL'}")
++
++# Fused clamp + activation + fp16 round + Hadamard vs the torch sequence the per-expert path runs.
++gate_f = torch.randn(x.shape[0], cols, device=dev) * 4
++up_f = torch.randn(x.shape[0], cols, device=dev) * 4
++for act, limit in ((1, 7.0), (1, 0.0), (0, 7.0)):
++    g, u = gate_f.clone(), up_f.clone()
++    if limit > 0:
++        g.clamp_(max=limit)
++        u.clamp_(min=-limit, max=limit)
++    a = torch.sigmoid(g * 1.702) * g * (u + 1.0) if act == 1 else torch.sigmoid(g) * g * u
++    ref = torch.empty(x.shape[0], cols, dtype=torch.float16, device=dev)
++    nat.exl3_had_r_128_grouped(a.half().contiguous(), ref, row_group, ptrs(scales), empty_l)
++    yo = torch.empty_like(ref)
++    nat.exl3_act_had_r_128_grouped(gate_f, up_f, yo, row_group, ptrs(scales), limit, 1.702, act)
++    r_act = rel(yo.float(), ref.float())
++    ok = r_act < 2e-3
++    fails += not ok
++    print(f"fused act={act} limit={limit}: rel {r_act:.1e} {'OK' if ok else 'FAIL'}")
++
++# Timing on the 2.15 lane's per-rank gate shape: 128 experts, ~256 rows each (8K tokens, top-4), K3.
++k, n_exp, size_in, size_out = 3, 128, 6144, 1536
++counts = torch.multinomial(torch.ones(n_exp), 8192 * 4, replacement=True).bincount(minlength=n_exp).tolist()
++rows = sum(counts)
++a = (torch.randn(rows, size_in, device=dev) * 0.5).half()
++tr, svh = experts(n_exp, size_in, size_out, k)
++starts = [0]
++for n in counts:
++    starts.append(starts[-1] + n)
++bounds = torch.tensor([b for g in range(n_exp) for b in (starts[g], starts[g + 1])], dtype=torch.int32, device=dev)
++out = torch.empty(rows, size_out, dtype=torch.float32, device=dev)
++views = [(a[starts[g]:starts[g + 1]], out[starts[g]:starts[g + 1]]) for g in range(n_exp)]
++tp, sp = ptrs(tr), ptrs(svh)
++
++
++def loop():
++    for g, (av, ov) in enumerate(views):
++        nat.exl3_fat_gemm(av, tr[g], ov, svh[g], k, False, False)
++
++
++def grouped():
++    nat.exl3_fat_gemm_grouped(a, tp, out, sp, bounds, empty_l, empty_h, k, False, False, False, size_out,
++                              max(counts))
++
++
++for name, fn in (("per-expert loop", loop), ("grouped", grouped)):
++    fn()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(10):
++        fn()
++    torch.cuda.synchronize()
++    ms = (time.perf_counter() - t) * 100
++    tflops = 2 * rows * size_in * size_out / (ms * 1e-3) / 1e12
++    print(f"{name}: {ms:.2f} ms ({tflops:.1f} TFLOPS) for {rows} rows over {n_exp} experts, {size_in}->{size_out}")
++sys.exit(1 if fails else 0)
+diff --git a/tests/gpu/test_fp8_dense_prefill.py b/tests/gpu/test_fp8_dense_prefill.py
+new file mode 100644
+index 0000000..394b2fa
+--- /dev/null
++++ b/tests/gpu/test_fp8_dense_prefill.py
+@@ -0,0 +1,130 @@
++"""FP8 dense prefill (exl3._dense_forward_fp8) vs the fp16 EXL3 reconstruct path (run in the image).
++
++1. Kernel exactness: the FP8 path equals an fp32 emulation of the same quantized math
++   (dequantized xq/wq, fp32 matmul, Hadamards) to bf16-accumulator precision.
++2. End-to-end error vs LinearEXL3's fp16 path on activations with outlier channels.
++3. Timing vs the fp16 path at the 2.15 lane's per-rank prefill shapes.
++"""
++import sys
++import time
++import types
++
++sys.path.insert(0, "/src/src")
++import torch
++from exllamav3.ext import exllamav3_ext as ext
++
++from vllm_exl3 import exl3 as X
++
++dev = "cuda"
++torch.manual_seed(0)
++nat = X._load_native_exl3_ext()
++fails = 0
++
++
++def rel(a, b):
++    return ((a - b).norm() / b.norm()).item()
++
++
++def make_linear(k, n, bits):
++    tr = torch.randint(-32768, 32767, (k // 16, n // 16, 16 * bits), dtype=torch.int16, device=dev)
++    suh = torch.where(torch.rand(k, device=dev) < 0.5, -1.0, 1.0).half() * (torch.rand(k, device=dev) * 0.5 + 0.75).half()
++    svh = (torch.rand(n, device=dev) * 0.02 + 0.01).half()
++    return types.SimpleNamespace(in_features=k, out_features=n, trellis=tr, K=bits, mcg=True, mul1=False,
++                                 suh=suh, svh=svh, bias=None)
++
++
++def fp16_ref(lin, x):
++    xh = torch.empty_like(x)
++    ext.had_r_128(x, xh, lin.suh, None, 1.0)
++    w = torch.empty(lin.in_features, lin.out_features, dtype=torch.half, device=dev)
++    ext.reconstruct(w, lin.trellis, lin.K, lin.mcg, lin.mul1)
++    y = (xh.float() @ w.float()).contiguous()
++    ext.had_r_128(y, y, None, lin.svh, 1.0)
++    return y
++
++
++def emulate(lin, x):
++    k, n = lin.in_features, lin.out_features
++    w = torch.empty(k, n, dtype=torch.half, device=dev)
++    ext.reconstruct(w, lin.trellis, lin.K, lin.mcg, lin.mul1)
++    ws = lin._exl3_fp8_w_scale
++    wq = torch.empty(n, k, dtype=torch.float8_e4m3fn, device=dev)
++    nat.exl3_fp16_to_fp8_t(w, wq, 1.0 / ws)
++    xq = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=dev)
++    rs = torch.empty(x.shape[0], dtype=torch.float32, device=dev)
++    nat.exl3_had_quant_fp8_rows(x, lin.suh, xq, rs)
++    # Independent checks of the two quantizers.
++    xh = torch.empty_like(x)
++    ext.had_r_128(x, xh, lin.suh, None, 1.0)
++    q_in = rel(xq.float() * rs[:, None], xh.float())
++    q_w = rel(wq.float().t() * ws, w.float())
++    y = (xq.float() * rs[:, None]) @ (wq.float().t() * ws)
++    y = y.contiguous()
++    ext.had_r_128(y, y, None, lin.svh, 1.0)
++    return y, q_in, q_w
++
++
++for k, n, bits in ((6144, 3072, 3), (3072, 6144, 2), (6144, 12288, 4)):
++    lin = make_linear(k, n, bits)
++    x = torch.randn(2048, k, device=dev)
++    x[:, torch.randperm(k)[:8]] *= 60.0  # outlier channels
++    x[0] *= 30.0  # one huge-norm row (attention-sink-like token)
++    x = x.half().contiguous()
++    y = X._dense_forward_fp8(lin, x)
++    emu, q_in, q_w = emulate(lin, x)
++    ref = fp16_ref(lin, x)
++    r_emu, r_ref = rel(y, emu), rel(y, ref)
++    ok = r_emu < 1e-2 and r_ref < 8e-2 and torch.isfinite(y).all().item()
++    fails += not ok
++    print(f"{k}->{n} K{bits}: vs fp32 emulation {r_emu:.1e} | vs fp16 EXL3 {r_ref:.1e} "
++          f"(input quant {q_in:.1e}, weight quant {q_w:.1e}) {'OK' if ok else 'FAIL'}")
++
++
++# bf16 input written into a bf16 column slice equals the fp32-output call on the same input.
++lin = make_linear(3072, 1024, 3)
++xb = (torch.randn(1500, 3072, device=dev) * 3).bfloat16()
++wide = torch.full((1500, 4096), float("nan"), dtype=torch.bfloat16, device=dev)
++X._dense_forward_fp8(lin, xb, out=wide[:, 1024:2048])
++ref32 = X._dense_forward_fp8(lin, xb)
++r_slice = rel(wide[:, 1024:2048].float(), ref32)
++untouched = bool(torch.isnan(wide[:, :1024]).all() and torch.isnan(wide[:, 2048:]).all())
++ok = r_slice < 1e-2 and untouched
++fails += not ok
++print(f"bf16 in -> bf16 slice out: rel {r_slice:.1e}, neighbours untouched {untouched} {'OK' if ok else 'FAIL'}")
++
++
++def timeit(fn, n=10):
++    fn()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(n):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t) / n * 1e3
++
++
++class FakeLinear:
++    """Enough of LinearEXL3.reconstruct_hgemm for timing the fp16 path on the same tensors."""
++
++
++for m in (8192,):
++    for k, n, bits in ((6144, 3072, 3), (3072, 6144, 2), (6144, 12288, 4), (6144, 6144, 3)):
++        lin = make_linear(k, n, bits)
++        x = torch.randn(m, k, device=dev).half()
++        w = torch.empty(k, n, dtype=torch.half, device=dev)
++        y16 = torch.empty(m, n, dtype=torch.float32, device=dev)
++
++        def fp16_path():
++            ext.reconstruct_had_slice(w, lin.trellis, lin.suh, lin.svh, lin.K, lin.mcg, lin.mul1, 0)
++            ext.hgemm_recon(x, w, y16)
++
++        t16 = timeit(fp16_path)
++        t8 = timeit(lambda: X._dense_forward_fp8(lin, x))
++        xb16 = x.bfloat16()
++        yb = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
++        t8b = timeit(lambda: X._dense_forward_fp8(lin, xb16, out=yb))
++        # fp16 path including the caller's bf16->fp16 input copy and fp32->bf16 output cast
++        t16g = timeit(lambda: (fp16_path(), xb16.to(torch.float16), y16.to(torch.bfloat16)))
++        print(f"M={m} {k}->{n}: fp16 {t16:.2f} ms ({t16g:.2f} with caller casts) | fp8 fp32-out {t8:.2f} ms | "
++              f"fp8 bf16 in/out {t8b:.2f} ms ({t16g / t8b:.2f}x)")
++sys.exit(1 if fails else 0)
+-- 
+2.51.0
+

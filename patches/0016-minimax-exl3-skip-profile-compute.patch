@@ -1,0 +1,93 @@
+From 4b9dc8ca9dd1d98c982e0258666a28229de96527 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 09:06:26 -0500
+Subject: [PATCH] Skip expert and wide dense GEMMs in vLLM's profile run when
+ kv_cache_memory_bytes is set
+
+With kv_cache_memory_bytes set, gpu_worker still runs profile_run: a full
+max_num_batched_tokens forward on dummy tokens (no attention metadata) that only
+warms the model up; no memory figure is taken from it and its outputs are
+discarded. At 16K tokens the EXL3 expert and wide dense GEMMs made it ~11 s of
+boot. They now return zeros of the right shape there (VLLM_EXL3_SKIP_PROFILE_COMPUTE,
+default on). Without kv_cache_memory_bytes the profile sizes the KV cache and runs
+in full; CUDA-graph capture and real batches never skip. B: init engine 18.1 -> 11.5 s,
+first 8K/16K prefill after boot at warm speed.
+---
+ src/vllm_exl3/exl3.py            | 33 ++++++++++++++++++++++++++++++++
+ src/vllm_exl3/weight_snapshot.py |  2 +-
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index 7917f6f..1b81667 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -161,6 +161,35 @@ except (TypeError, ValueError):
+     FAT_EXPERT_THRESHOLD = 256
+     FAT_THRESHOLD_PREFILL = 256
+     FAT_PREFILL_TOKENS = 1024
++_EXL3_SKIP_PROFILE_COMPUTE = os.environ.get("VLLM_EXL3_SKIP_PROFILE_COMPUTE", "1") == "1"
++_EXL3_SKIP_PROFILE_MIN_ROWS = 1024
++
++
++def _profile_run_skip(rows: int) -> bool:
++    """True inside vLLM's profile run when nothing is sized from it.
++
++    With kv_cache_memory_bytes set, gpu_worker still runs profile_run (a full
++    max_num_batched_tokens forward on dummy tokens, without attention metadata)
++    only to warm the model up; its outputs are discarded and no memory figure is
++    taken. The expert and wide dense GEMMs then cost seconds of boot (~11 s at
++    16K tokens) for nothing, so they return zeros of the right shape. Without
++    kv_cache_memory_bytes the profile measures peak memory and runs in full.
++    CUDA-graph capture and real batches (which carry attention metadata) never
++    skip.
++    """
++    if not _EXL3_SKIP_PROFILE_COMPUTE or rows < _EXL3_SKIP_PROFILE_MIN_ROWS:
++        return False
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    try:
++        from vllm.config.vllm import get_current_vllm_config_or_none
++        from vllm.forward_context import get_forward_context, is_forward_context_available
++    except ImportError:
++        return False
++    if not is_forward_context_available() or get_forward_context().attn_metadata is not None:
++        return False
++    config = get_current_vllm_config_or_none()
++    return bool(config is not None and config.cache_config.kv_cache_memory_bytes)
+ MOE_ACT_SILU = 0
+ # Non-gated relu2 (NemotronH): the gate GEMM is skipped by the kernel; the gate
+ # lane is set to relu(u) so the gate multiply yields relu(u) * u = relu^2(u)
+@@ -5550,6 +5579,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         # act 3) and beta (must be None/1.0) and returns the clamp limit.
+         _alpha, limit = resolve_moe_gate_params(self._gate_param_source(layer))
+         del _alpha
++        if _profile_run_skip(int(x.shape[0])):
++            return torch.zeros_like(x)
+         return apply_exl3_experts(
+             x, topk_ids, topk_weights, layer, limit=limit
+         )
+@@ -7209,6 +7240,8 @@ class Exl3LinearMethod(LinearMethodBase):
+         if plan is None:
+             return None
+         offsets, total, runs = plan
++        if _profile_run_skip(rows):
++            return torch.zeros((rows, total), dtype=x_2d.dtype, device=x_2d.device)
+         x_in = x_2d.contiguous()
+         y = torch.empty((rows, total), dtype=x_2d.dtype, device=x_2d.device)
+         sizes = layer._exl3_linear_output_partition_sizes
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index 076fe24..010c240 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -61,7 +61,7 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_FP8_PREFILL_SKIP", "VLLM_EXL3_BF16_PREFILL", "VLLM_EXL3_BF16_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_MIXEDK_M64_MIN_TOKENS",
+-    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "VLLM_EXL3_SPARSE_TILED", "VLLM_EXL3_SPARSE_TILED_MIN_ROWS", "VLLM_EXL3_FAT_THRESHOLD_PREFILL", "VLLM_EXL3_FAT_PREFILL_TOKENS",
++    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "VLLM_EXL3_SPARSE_TILED", "VLLM_EXL3_SPARSE_TILED_MIN_ROWS", "VLLM_EXL3_FAT_THRESHOLD_PREFILL", "VLLM_EXL3_FAT_PREFILL_TOKENS", "VLLM_EXL3_SKIP_PROFILE_COMPUTE",
+ })
+ 
+ try:
+-- 
+2.51.0
+

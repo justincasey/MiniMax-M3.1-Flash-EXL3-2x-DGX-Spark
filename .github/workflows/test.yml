@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-gpu:
+    # No GPU or Sparks here: contract tests, pack layout, and the build's staging step
+    # (fetches both pinned engine commits, applies both patch series, checks the
+    # staged trees against the hardware-validated digests).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: python3 -m py_compile bench/*.py scripts/*.py tests/*.py
+      - name: Contract tests
+        run: bash tests/test_recipe.sh
+      - name: Pack layout and staging
+        run: python3 tests/test_pack_layout.py

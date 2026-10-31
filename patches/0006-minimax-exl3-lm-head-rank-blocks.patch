@@ -1,0 +1,79 @@
+From de6bde088f49a33dddba6d72a8143b478da67021 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:01:21 -0500
+Subject: [PATCH] EXL3 LM head under TP>1: compute only this rank's 128-column
+ blocks
+
+Every rank loads the whole head (100,032 rows per rank is not 128-aligned)
+and used to compute all 200,064 logits before keeping its partition: ~8 ms
+of a ~112 ms decode step. The output Hadamard works per 128-column block, so
+after loading, the trellis and svh are cut to the blocks covering this rank's
+vocab range (782 of 1,563 at TP=2); apply() slices relative to the first kept
+column. Decode c=1 22.1 -> 23.5 tok/s, c=4 51.1 -> 54.3 (both clusters).
+---
+ src/vllm_exl3/exl3.py | 40 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index b26af29..8cb11ac 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -1483,10 +1483,44 @@ def _lm_head_full_vocab(layer, output_size: int) -> int | None:
+     return int(output_size)
+ 
+ 
++def _narrow_lm_head(layer, linears: list) -> None:
++    """Keep only the 128-column Hadamard blocks that cover this rank's vocab range.
++
++    The full head is loaded on every rank because a 100,032-row split is not
++    128-aligned, but each rank only needs its own partition of the logits. The
++    output Hadamard works per 128-column block, so cutting the trellis (16-column
++    tiles) and svh at block boundaries is exact: each rank then computes ~half of
++    the head (782 of 1,563 blocks for MiniMax-M3 at TP=2) and frees the rest.
++    """
++    if len(linears) != 1 or linears[0] is None:
++        return
++    lin = linears[0]
++    si = layer.shard_indices
++    start, end = int(si.org_vocab_start_index), int(si.org_vocab_end_index)
++    total = int(lin.out_features)
++    c0 = start // 128 * 128
++    c1 = min(total, -(-end // 128) * 128)
++    if c0 == 0 and c1 == total:
++        return
++    linears[0] = make_linear_exl3(
++        lin.trellis[:, c0 // 16 : c1 // 16],
++        lin.suh,
++        lin.svh[c0:c1],
++        lin.mcg_tensor,
++        lin.mul1_tensor,
++        out_dtype=lin.out_dtype,
++    )
++    layer._exl3_lm_col0 = c0
++
++
+ def _lm_head_rank_slice(layer, y: torch.Tensor) -> torch.Tensor:
+-    """This rank's vocab partition of full-head logits, padded to num_embeddings_per_partition."""
++    """This rank's vocab partition of the head logits, padded to num_embeddings_per_partition.
++
++    ``y`` holds columns from ``_exl3_lm_col0`` on (0 unless _narrow_lm_head cut the head).
++    """
+     si = layer.shard_indices
+-    part = y[..., si.org_vocab_start_index : si.org_vocab_end_index]
++    col0 = int(getattr(layer, "_exl3_lm_col0", 0))
++    part = y[..., si.org_vocab_start_index - col0 : si.org_vocab_end_index - col0]
+     width = int(layer.num_embeddings_per_partition)
+     if part.shape[-1] < width:
+         part = torch.nn.functional.pad(part, (0, width - part.shape[-1]))
+@@ -6584,6 +6618,8 @@ class Exl3LinearMethod(LinearMethodBase):
+                 )
+                 linears.append(linear)
+ 
++        if getattr(layer, "_exl3_lm_full", False):
++            _narrow_lm_head(layer, linears)
+         layer._exl3_linears = linears
+         layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear", self)
+ 
+-- 
+2.51.0
+

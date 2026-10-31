@@ -1,0 +1,169 @@
+From b81333bd5bb0ec481fd5b6fcc114a0bd800dce71 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 05:31:17 -0500
+Subject: [PATCH] Tiled sparse attention: tile metadata on the GPU, no host
+ sync
+
+build_tiles used Python loops over cu_seqlens/prefix_lens lists, and the wrapper read them
+with .tolist() on every layer; each read synchronized the stream, serializing kernel launch
+with execution 60 times per prefill chunk. The tile count is now bounded from shapes
+(total_q // tile + num_reqs), the tile -> request map is a GPU searchsorted, and surplus
+tiles carry zero rows and exit at once. Outputs unchanged (tests/gpu/test_sparse_attn_tiled.py).
+---
+ src/vllm_exl3/minimax_q4kv.py       |  2 +-
+ src/vllm_exl3/sparse_attn_tiled.py  | 47 +++++++++++++++++++----------
+ tests/gpu/bench_sparse_attn.py      |  8 ++---
+ tests/gpu/bench_sparse_attn_real.py |  4 +--
+ tests/gpu/test_sparse_attn_tiled.py |  2 +-
+ 5 files changed, 39 insertions(+), 24 deletions(-)
+
+diff --git a/src/vllm_exl3/minimax_q4kv.py b/src/vllm_exl3/minimax_q4kv.py
+index bcd5c0a..62df598 100644
+--- a/src/vllm_exl3/minimax_q4kv.py
++++ b/src/vllm_exl3/minimax_q4kv.py
+@@ -677,7 +677,7 @@ def _make_prefill_wrapper(original):
+             # against an fp32 reference as vLLM's kernel; short calls keep vLLM's kernel.
+             if _SPARSE_TILED and int(q_.shape[0]) >= _SPARSE_TILED_MIN_ROWS:
+                 return sparse_attn_tiled(
+-                    q_, kv_, topk_, bt_, cu_.reshape(-1).tolist(), sl_, pl_.reshape(-1).tolist(),
++                    q_, kv_, topk_, bt_, cu_, sl_, pl_,
+                     int(kvh_), float(scale_), out_, tile=8, num_warps=8, num_stages=1,
+                 )
+             return original(q_, kv_, topk_, bt_, cu_, sl_, pl_, maxq_, kvh_, scale_, out_)
+diff --git a/src/vllm_exl3/sparse_attn_tiled.py b/src/vllm_exl3/sparse_attn_tiled.py
+index 96ff01f..a76933f 100644
+--- a/src/vllm_exl3/sparse_attn_tiled.py
++++ b/src/vllm_exl3/sparse_attn_tiled.py
+@@ -58,8 +58,10 @@ def _gqa_sparse_tiled_fwd_kernel(
+     pid_t = tl.program_id(0)
+     pid_kh = tl.program_id(1)
+     ROWS: tl.constexpr = T * BLOCK_H
+-    q0 = tl.load(tile_q0_ptr + pid_t)
+     nrows = tl.load(tile_n_ptr + pid_t)
++    if nrows <= 0:
++        return
++    q0 = tl.load(tile_q0_ptr + pid_t)
+     req = tl.load(tile_req_ptr + pid_t)
+     qabs0 = tl.load(tile_qabs0_ptr + pid_t)
+     seq_len = tl.load(seq_len_ptr + req)
+@@ -123,18 +125,31 @@ def _gqa_sparse_tiled_fwd_kernel(
+     )
+ 
+ 
+-def build_tiles(cu_seqlens_q: list[int], prefix_lens: list[int], tile: int, device):
+-    """Tiles of ``tile`` consecutive rows that never cross a request boundary."""
+-    q0, n, req, qabs0 = [], [], [], []
+-    for b in range(len(cu_seqlens_q) - 1):
+-        qs, qe = int(cu_seqlens_q[b]), int(cu_seqlens_q[b + 1])
+-        for s in range(qs, qe, tile):
+-            q0.append(s)
+-            n.append(min(tile, qe - s))
+-            req.append(b)
+-            qabs0.append(int(prefix_lens[b]) + (s - qs))
+-    as_t = lambda xs: torch.tensor(xs, dtype=torch.int32, device=device)
+-    return as_t(q0), as_t(n), as_t(req), as_t(qabs0)
++def build_tiles(cu_seqlens_q: torch.Tensor, prefix_lens: torch.Tensor, total_q: int, tile: int):
++    """Tiles of ``tile`` consecutive rows that never cross a request boundary, on the GPU.
++
++    No host sync: the tile count is bounded from shapes (total_q // tile + num_reqs) and
++    surplus tiles get zero rows (the kernel exits on them).
++    """
++    dev = cu_seqlens_q.device
++    num_reqs = int(cu_seqlens_q.shape[0]) - 1
++    cu = cu_seqlens_q.reshape(-1).to(torch.int64)
++    lens = cu[1:] - cu[:-1]
++    ntile = (lens + tile - 1) // tile
++    ends = torch.cumsum(ntile, 0)
++    starts = ends - ntile
++    n_max = total_q // tile + num_reqs
++    t = torch.arange(n_max, device=dev, dtype=torch.int64)
++    req = torch.searchsorted(ends, t, right=True)
++    valid = req < num_reqs
++    req_c = torch.clamp(req, max=max(num_reqs - 1, 0))
++    local = t - starts[req_c]
++    q0 = cu[req_c] + local * tile
++    n = torch.clamp(lens[req_c] - local * tile, min=0, max=tile)
++    n = torch.where(valid, n, torch.zeros_like(n))
++    qabs0 = prefix_lens.reshape(-1).to(torch.int64)[req_c] + local * tile
++    i32 = lambda x: x.to(torch.int32).contiguous()
++    return i32(q0), i32(n), i32(req_c), i32(qabs0)
+ 
+ 
+ def build_union(topk_idx: torch.Tensor, tile_q0, tile_n, tile_qabs0, tile: int):
+@@ -173,12 +188,12 @@ def build_union(topk_idx: torch.Tensor, tile_q0, tile_n, tile_qabs0, tile: int):
+ 
+ 
+ def sparse_attn_tiled(
+-    q, kv_cache, topk_idx, block_table, cu_seqlens_q: list[int], seq_lens, prefix_lens: list[int],
+-    num_kv_heads: int, sm_scale: float, output, tile: int = 4, num_warps: int = 4, num_stages: int = 1,
++    q, kv_cache, topk_idx, block_table, cu_seqlens_q: torch.Tensor, seq_lens, prefix_lens: torch.Tensor,
++    num_kv_heads: int, sm_scale: float, output, tile: int = 8, num_warps: int = 8, num_stages: int = 1,
+ ):
+     total_q, num_heads, head_dim = q.shape
+     gqa = num_heads // num_kv_heads
+-    tile_q0, tile_n, tile_req, tile_qabs0 = build_tiles(cu_seqlens_q, prefix_lens, tile, q.device)
++    tile_q0, tile_n, tile_req, tile_qabs0 = build_tiles(cu_seqlens_q, prefix_lens, int(total_q), tile)
+     union, ucount, sel = build_union(topk_idx, tile_q0, tile_n, tile_qabs0, tile)
+     n_tiles = tile_q0.numel()
+     _gqa_sparse_tiled_fwd_kernel[(n_tiles, num_kv_heads)](
+diff --git a/tests/gpu/bench_sparse_attn.py b/tests/gpu/bench_sparse_attn.py
+index 1544e2a..ca1345c 100644
+--- a/tests/gpu/bench_sparse_attn.py
++++ b/tests/gpu/bench_sparse_attn.py
+@@ -63,12 +63,12 @@ from vllm_exl3.sparse_attn_tiled import sparse_attn_tiled, build_tiles, build_un
+ 
+ for tile, nw in ((2, 4), (4, 4), (4, 8), (8, 8)):
+     out = torch.empty_like(q)
+-    sparse_attn_tiled(q, kv, topk, bt, [0, Q], sl, [PREFIX], KVH, scale, out, tile=tile, num_warps=nw)
++    sparse_attn_tiled(q, kv, topk, bt, cu, sl, pl, KVH, scale, out, tile=tile, num_warps=nw)
+     torch.cuda.synchronize()
+     rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+     worst = ((out.float() - ref.float()).abs().max()).item()
+-    t = timeit(lambda: sparse_attn_tiled(q, kv, topk, bt, [0, Q], sl, [PREFIX], KVH, scale, out, tile=tile, num_warps=nw))
+-    tq = build_tiles([0, Q], [PREFIX], tile, dev)
++    t = timeit(lambda: sparse_attn_tiled(q, kv, topk, bt, cu, sl, pl, KVH, scale, out, tile=tile, num_warps=nw))
++    tq = build_tiles(cu, pl, Q, tile)
+     tm = timeit(lambda: build_union(topk, tq[0], tq[1], tq[3], tile))
+     u = build_union(topk, tq[0], tq[1], tq[3], tile)[1].float().mean().item()
+     print(f"tiled T={tile} warps={nw}: {t:.2f} ms ({t0 / t:.2f}x; metadata {tm:.2f} ms; mean union {u:.1f} blocks) rel {rel:.1e} max|d| {worst:.1e}")
+@@ -92,6 +92,6 @@ sa._gqa_sparse_fwd_kernel[(Q2, KVH, 1)](
+     0, 0, 0, 0, topk2.stride(0), topk2.stride(1), topk2.stride(2), ref2.stride(0), ref2.stride(1), ref2.stride(2),
+     bt.stride(0), BLOCK_SIZE_Q=1, BLOCK_SIZE_K=128, USE_FP8=False, KV_SCALE_MODE=0)
+ out2 = torch.empty_like(q2)
+-sparse_attn_tiled(q2, kv, topk2, bt, [0, Q2], sl2, [0], KVH, scale, out2, tile=4)
++sparse_attn_tiled(q2, kv, topk2, bt, cu2, sl2, pl2, KVH, scale, out2, tile=4)
+ torch.cuda.synchronize()
+ print(f"first chunk (no prefix): rel {((out2.float() - ref2.float()).norm() / ref2.float().norm()).item():.1e}")
+diff --git a/tests/gpu/bench_sparse_attn_real.py b/tests/gpu/bench_sparse_attn_real.py
+index 32ceb97..bde5523 100644
+--- a/tests/gpu/bench_sparse_attn_real.py
++++ b/tests/gpu/bench_sparse_attn_real.py
+@@ -35,10 +35,10 @@ t0 = timeit(orig)
+ print(f"vLLM kernel: {t0:.2f} ms")
+ for tile, nw, ns in ((8, 4, 1), (8, 8, 1), (8, 8, 2), (8, 8, 3), (8, 16, 1)):
+     out = torch.empty_like(q)
+-    fn = lambda: sparse_attn_tiled(q, kv, topk, bt, cu_l, sl, pl_l, KVH, scale, out, tile=tile, num_warps=nw, num_stages=ns)
++    fn = lambda: sparse_attn_tiled(q, kv, topk, bt, cu, sl, pl, KVH, scale, out, tile=tile, num_warps=nw, num_stages=ns)
+     fn(); torch.cuda.synchronize()
+     rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+     t = timeit(fn)
+-    tq = build_tiles(cu_l, pl_l, tile, dev)
++    tq = build_tiles(cu, pl, Q, tile)
+     u = build_union(topk, tq[0], tq[1], tq[3], tile)[1].float().mean().item()
+     print(f"tiled T={tile:2d} warps={nw} stages={ns}: {t:.2f} ms ({t0 / t:.2f}x) mean union {u:.1f} blocks (vs {tile * TOPK} unshared) rel {rel:.1e}")
+diff --git a/tests/gpu/test_sparse_attn_tiled.py b/tests/gpu/test_sparse_attn_tiled.py
+index 9fd05d1..bf79a4f 100644
+--- a/tests/gpu/test_sparse_attn_tiled.py
++++ b/tests/gpu/test_sparse_attn_tiled.py
+@@ -41,7 +41,7 @@ def case(lens, prefixes, name):
+     ref = torch.zeros_like(q)
+     sa.minimax_m3_sparse_attn(q, kv, topk, bt, cu, sl, pl, max(lens), KVH, D ** -0.5, ref)
+     out = torch.zeros_like(q)
+-    sparse_attn_tiled(q, kv, topk, bt, cu.tolist(), sl, prefixes, KVH, D ** -0.5, out, tile=8, num_warps=8, num_stages=1)
++    sparse_attn_tiled(q, kv, topk, bt, cu, sl, pl, KVH, D ** -0.5, out, tile=8, num_warps=8, num_stages=1)
+     torch.cuda.synchronize()
+     # fp32 ground truth over each row's selected, causal keys.
+     exact = torch.zeros(total, H, D, dtype=torch.float32, device=dev)
+-- 
+2.51.0
+

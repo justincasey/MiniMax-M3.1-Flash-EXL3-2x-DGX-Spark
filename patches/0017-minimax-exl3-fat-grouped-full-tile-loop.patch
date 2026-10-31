@@ -1,0 +1,75 @@
+From 7ac4fbc3bb322a393366a36d22fbbc0f74524fd0 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 09:01:36 -0500
+Subject: [PATCH] Grouped fat GEMM: full tiles take an M-block loop without
+ early exits
+
+With the per-block mb_valid exit inside the unrolled loop the compiler issued
+each ldmatrix right before the MMA that used it (short-scoreboard stalls on
+every M-block). Full 128-row tiles now run a branch-free loop; the partial
+last tile of an expert keeps the exit. Same MMAs in the same order: grouped
+output stays bit-identical to the per-expert kernel.
+
+GB10, live MiniMax-M3.1 TP2 shapes, alternating processes vs 10b691d:
+gate|up K2 17.57 -> 17.03 ms, gate|up K3 17.51 -> 16.71 ms, down unchanged.
+---
+ CHANGELOG.md          |  5 +++++
+ csrc/exl3_fat_gemm.cu | 21 +++++++++++++++++----
+ 2 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 05b6d89..eb1eab6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -72,6 +72,11 @@
+   (58.7 -> 70.6 TFLOPS), down K2 scatter 14.1 -> 13.1 ms, gate|up K3 21.0 -> 17.6 ms, down K3
+   14.9 -> 13.3 ms.
+ 
++- Grouped fat-expert GEMM: full 128-row tiles take a separate M-block loop without the
++  per-block early exit, so the A fragment loads are scheduled ahead of their MMAs (with the
++  exit in the loop each `ldmatrix` fed the next MMA directly). Same MMAs, same order. GB10,
++  live shapes: gate|up K2 17.57 -> 17.03 ms, K3 17.51 -> 16.71 ms; down unchanged.
++
+ - Unified `exl3_moe_mixedk` is the default mixed-K dispatch on every device.
+   Per-K-group dispatch costs one launch plus ~9 ATen kernels per K tuple per
+   layer per step at `MOE_SMS_PER_EXPERT` = 8 CTAs of 48, and at decode a group
+diff --git a/csrc/exl3_fat_gemm.cu b/csrc/exl3_fat_gemm.cu
+index 125527b..2fa02f1 100644
+--- a/csrc/exl3_fat_gemm.cu
++++ b/csrc/exl3_fat_gemm.cu
+@@ -364,15 +364,28 @@ void exl3_fat_gemm_grouped_kernel(
+                 __syncthreads();
+             }
+             const int4* sub_a = stage_a + sub * (A_SUB / 8);
+-            #pragma unroll
+-            for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
+-            {
+-                if (mb >= mb_valid) break;
++            auto mma_block = [&](int mb) {
+                 FragA frag_a;
+                 const int row = a_row_lane + mb * 16;
+                 ldsm4(frag_a, sub_a + row * 2 + (a_col_lane ^ ((row >> 2) & 1)));
+                 ptx_mma_m16n8k16(frag_a, frag_b0[cur], frag_c[mb][0]);
+                 ptx_mma_m16n8k16(frag_a, frag_b1[cur], frag_c[mb][1]);
++            };
++            if (mb_valid == FAT_M_BLOCKS)
++            {
++                // Full tile, its own path: without per-block exits the A fragment loads are
++                // scheduled ahead of the MMAs that use them.
++                #pragma unroll
++                for (int mb = 0; mb < FAT_M_BLOCKS; ++mb) mma_block(mb);
++            }
++            else
++            {
++                #pragma unroll
++                for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
++                {
++                    if (mb >= mb_valid) break;
++                    mma_block(mb);
++                }
+             }
+             if (boundary)
+             {
+-- 
+2.51.0
+

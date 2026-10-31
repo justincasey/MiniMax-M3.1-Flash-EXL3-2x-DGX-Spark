@@ -1,0 +1,8 @@
+.env
+.work/
+runs/
+bench/runs/
+__pycache__/
+*.pyc
+.ruff_cache/
+*.download.log

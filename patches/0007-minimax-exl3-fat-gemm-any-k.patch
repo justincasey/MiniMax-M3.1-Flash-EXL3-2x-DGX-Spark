@@ -1,0 +1,268 @@
+From 89ddcfde358a9783ba098a575ce24141df41edb4 Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:59:14 -0500
+Subject: [PATCH] Native fat GEMM for any trellis width; route mixed-K fat
+ experts through it
+
+The fused fat-expert kernel (dequant + MMA + output Hadamard, optional token
+scatter; from Mia's AI Lab, MIT) only accepted K4 MCG trellises, so on a
+tensor-mixed-K pack (K2/K3 experts, per-projection widths) every fat expert
+fell back to reconstruct + cuBLAS + a separate Hadamard + index_add, launched
+per expert. Template the kernel on K (1..8) and the codebook (3INST/MCG/MUL1),
+export EXL3_FAT_GEMM_MAX_K, and run gate, up (fp32, output Hadamard fused) and
+down (scatter into the MoE output) through it whenever it covers the expert.
+Equivalence vs the fallback on random trellises: 2e-4 relative error for
+K2-5 x 3 codebooks, GEMM and scatter. MiniMax-M3.1 2.15bpw TP=2: prefill
+884 -> 921 tok/s at 16K-token chunks; 16K needles 3/3; a 12K-token
+teacher-forced NLL is now deterministic (6.9241 in three runs) where the
+trellis kernel alone varies 7.85-8.25.
+---
+ csrc/bindings.cpp     |  2 ++
+ csrc/exl3_fat_gemm.cu | 64 ++++++++++++++++++++++++++++++++-----------
+ src/vllm_exl3/exl3.py | 36 ++++++++++++++++++++----
+ 3 files changed, 81 insertions(+), 21 deletions(-)
+
+diff --git a/csrc/bindings.cpp b/csrc/bindings.cpp
+index bd7c4bf..6c20e11 100644
+--- a/csrc/bindings.cpp
++++ b/csrc/bindings.cpp
+@@ -256,6 +256,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     // degrades to the per-row mk path when it is absent.
+     m.attr("P2B_MOE_PADDED") = true;
+ 
++    // Trellis widths the fat GEMM kernels accept (the original kernel was K4 MCG only).
++    m.attr("EXL3_FAT_GEMM_MAX_K") = 8;
+     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
+           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
+           py::arg("K"), py::arg("mcg"), py::arg("mul1"));
+diff --git a/csrc/exl3_fat_gemm.cu b/csrc/exl3_fat_gemm.cu
+index 1986e96..3dc4453 100644
+--- a/csrc/exl3_fat_gemm.cu
++++ b/csrc/exl3_fat_gemm.cu
+@@ -5,8 +5,10 @@
+ // Copyright (c) 2026 Mia's AI Lab. Licensed under the MIT License.
+ // Full licence text: see THIRD_PARTY_NOTICES.md in the root of this repository.
+ //
+-// Modification from the original: three #include paths adjusted for this
+-// project's source layout. The kernel is otherwise unchanged.
++// Modifications from the original: three #include paths adjusted for this
++// project's source layout; the kernel is templated on the trellis width K
++// (1..8 bits) and the codebook (3INST / MCG / MUL1) instead of K4 MCG only, so
++// tensor-mixed-K packs (K2/K3 experts) take the fused path too.
+ 
+ #include <cuda_fp16.h>
+ #include <c10/cuda/CUDAGuard.h>
+@@ -27,7 +29,6 @@ constexpr int FAT_TILE_K = 16;
+ constexpr int FAT_TILE_N = 128;
+ constexpr int FAT_M_BLOCKS = FAT_TILE_M / 16;
+ constexpr int FAT_N_BLOCKS = FAT_TILE_N / 16;
+-constexpr int FAT_PACKED_WORDS = 4 * 16;
+ constexpr float HAD_SCALE = 0.088388347648f;
+ 
+ __device__ inline void fat_had_ff_128(
+@@ -62,7 +63,8 @@ __device__ inline void fat_had_ff_128(
+     reinterpret_cast<float4*>(output_ptr)[lane] = v;
+ }
+ 
+-template <bool scatter>
++// One 16x16 trellis tile packs 256 weights at K bits: 16 * K int16 words.
++template <int K, int CB, bool scatter>
+ __global__ __launch_bounds__(FAT_THREADS)
+ void exl3_fat_gemm_kernel(
+     const half* __restrict__ a,
+@@ -75,6 +77,7 @@ void exl3_fat_gemm_kernel(
+     int size_k,
+     int size_n)
+ {
++    constexpr int FAT_PACKED_WORDS = 16 * K;
+     extern __shared__ unsigned char shared_raw[];
+     half* sh_a = reinterpret_cast<half*>(shared_raw);
+     uint16_t* sh_b = reinterpret_cast<uint16_t*>(sh_a + FAT_TILE_M * FAT_TILE_K);
+@@ -109,7 +112,8 @@ void exl3_fat_gemm_kernel(
+         }
+         reinterpret_cast<int4*>(sh_a)[a_row * 2 + a_dst_col8] = a_value;
+ 
+-        if (t < 64)
++        // FAT_N_BLOCKS tiles x FAT_PACKED_WORDS int16 = 16 * K int4 loads.
++        if (t < 16 * K)
+         {
+             const int4* b_src = reinterpret_cast<const int4*>(
+                 packed + (k_block * tiles_n + n_base / 16) * FAT_PACKED_WORDS);
+@@ -121,7 +125,7 @@ void exl3_fat_gemm_kernel(
+         FragB frag_b1;
+         const uint32_t* warp_b = reinterpret_cast<const uint32_t*>(
+             sh_b + warp * FAT_PACKED_WORDS);
+-        dq_dispatch<4, 1>(warp_b, lane << 3, frag_b0, frag_b1);
++        dq_dispatch<K, CB>(warp_b, lane << 3, frag_b0, frag_b1);
+ 
+         #pragma unroll
+         for (int mb = 0; mb < FAT_M_BLOCKS; ++mb)
+@@ -215,22 +219,22 @@ void check_common(
+     TORCH_CHECK(svh.scalar_type() == at::kHalf, "svh must be float16");
+     TORCH_CHECK(a.dim() == 2 && packed.dim() == 3 && out.dim() == 2 && svh.dim() == 1,
+                 "exl3_fat_gemm expects rank-2/rank-3 tensors");
+-    TORCH_CHECK(K == 4 && mcg && !mul1,
+-                "exl3_fat_gemm currently supports only K4 MCG tensors");
++    TORCH_CHECK(K >= 1 && K <= 8, "exl3_fat_gemm supports K 1..8, got ", K);
++    TORCH_CHECK(!(mcg && mul1), "exl3_fat_gemm: mcg and mul1 are exclusive");
+     TORCH_CHECK(a.size(1) == packed.size(0) * 16,
+                 "a K dimension does not match packed tensor");
+     TORCH_CHECK(svh.numel() == packed.size(1) * 16,
+                 "svh N dimension does not match packed tensor");
+     TORCH_CHECK(svh.numel() % FAT_TILE_N == 0,
+                 "output dimension must be divisible by 128");
+-    TORCH_CHECK(packed.size(2) == FAT_PACKED_WORDS,
+-                "packed K4 block width must be 64 int16 words");
++    TORCH_CHECK(packed.size(2) == 16 * K,
++                "packed block width must be 16 * K int16 words");
+     TORCH_CHECK(a.device() == packed.device() && a.device() == out.device() && a.device() == svh.device(),
+                 "exl3_fat_gemm tensors must share a device");
+ }
+ 
+-template <bool scatter>
+-void launch(
++template <int K, int CB, bool scatter>
++void launch_k(
+     at::Tensor a,
+     at::Tensor packed,
+     at::Tensor out,
+@@ -246,9 +250,9 @@ void launch(
+     dim3 block(FAT_THREADS);
+     dim3 grid(size_n / FAT_TILE_N, (size_m + FAT_TILE_M - 1) / FAT_TILE_M);
+     size_t shared = FAT_TILE_M * FAT_TILE_K * sizeof(half)
+-                  + FAT_N_BLOCKS * FAT_PACKED_WORDS * sizeof(uint16_t)
++                  + FAT_N_BLOCKS * 16 * K * sizeof(uint16_t)
+                   + 16 * FAT_TILE_N * sizeof(float);
+-    exl3_fat_gemm_kernel<scatter><<<grid, block, shared, stream>>>(
++    exl3_fat_gemm_kernel<K, CB, scatter><<<grid, block, shared, stream>>>(
+         reinterpret_cast<const half*>(a.data_ptr()),
+         reinterpret_cast<const uint16_t*>(packed.data_ptr()),
+         reinterpret_cast<float*>(out.data_ptr()),
+@@ -261,6 +265,34 @@ void launch(
+     cuda_check(cudaPeekAtLastError());
+ }
+ 
++template <int CB, bool scatter>
++void launch_cb(int64_t K, at::Tensor a, at::Tensor packed, at::Tensor out, at::Tensor svh,
++               at::Tensor token_idx, at::Tensor route_weight)
++{
++    switch (K)
++    {
++        case 1: launch_k<1, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        case 2: launch_k<2, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        case 3: launch_k<3, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        case 4: launch_k<4, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        case 5: launch_k<5, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        case 6: launch_k<6, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        case 7: launch_k<7, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        case 8: launch_k<8, CB, scatter>(a, packed, out, svh, token_idx, route_weight); break;
++        default: TORCH_CHECK(false, "exl3_fat_gemm: unsupported K ", K);
++    }
++}
++
++// Codebook index as exllamav3's dq_dispatch takes it: 0 = 3INST, 1 = MCG, 2 = MUL1.
++template <bool scatter>
++void launch(int64_t K, bool mcg, bool mul1, at::Tensor a, at::Tensor packed, at::Tensor out,
++            at::Tensor svh, at::Tensor token_idx, at::Tensor route_weight)
++{
++    if (mcg) launch_cb<1, scatter>(K, a, packed, out, svh, token_idx, route_weight);
++    else if (mul1) launch_cb<2, scatter>(K, a, packed, out, svh, token_idx, route_weight);
++    else launch_cb<0, scatter>(K, a, packed, out, svh, token_idx, route_weight);
++}
++
+ }  // namespace
+ 
+ void exl3_fat_gemm(
+@@ -275,7 +307,7 @@ void exl3_fat_gemm(
+     check_common(a, packed, out, svh, K, mcg, mul1);
+     TORCH_CHECK(out.size(0) == a.size(0) && out.size(1) == svh.numel(),
+                 "out shape must be [M, N]");
+-    launch<false>(a, packed, out, svh, at::Tensor(), at::Tensor());
++    launch<false>(K, mcg, mul1, a, packed, out, svh, at::Tensor(), at::Tensor());
+ }
+ 
+ void exl3_fat_gemm_scatter(
+@@ -301,5 +333,5 @@ void exl3_fat_gemm_scatter(
+                 "routing tensors must have M elements");
+     TORCH_CHECK(token_idx.device() == a.device() && route_weight.device() == a.device(),
+                 "routing tensors must share a device with a");
+-    launch<true>(a, packed, out, svh, token_idx, route_weight);
++    launch<true>(K, mcg, mul1, a, packed, out, svh, token_idx, route_weight);
+ }
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index 8cb11ac..46f2920 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -3130,14 +3130,26 @@ def apply_exl3_batched_fat(
+             inners[e]["_exl3_gate_up_shared_suh"] = shared_suh
+         distinct_suh = not shared_suh
+         distinct_pack = distinct_suh or distinct_gu
+-        if not distinct_pack:
++        # Per-projection fused GEMM (native kernel templated on K): each of gate,
++        # up and down runs dequant + MMA + output Hadamard in one launch, and down
++        # scatters into ``out``; works for any per-projection K (mixed-K packs).
++        native_any = bool(
++            use_kernel
++            and not gateless
++            and native_c is not None
++            and int(getattr(native_c, "EXL3_FAT_GEMM_MAX_K", 0))
++            >= max(int(getattr(gate, "K", 4)), int(getattr(up, "K", 4)), int(getattr(down, "K", 4)))
++            and intermediate % 128 == 0
++            and int(down.out_features) % 128 == 0
++        )
++        if not distinct_pack and not native_any:
+             ext.had_r_128(h, h13, gate.suh, None, 1.0)
+ 
+         packed13 = scratch["packed13"]
+         out_tiles = int(gate.trellis.shape[1])
+         gate_up = scratch["gate_up"][:n_rows]
+         svh13 = scratch["svh13"]
+-        if not distinct_pack:
++        if not distinct_pack and not native_any:
+             packed13[:, :out_tiles].copy_(gate.trellis)
+             packed13[:, out_tiles:].copy_(up.trellis)
+             svh13[:intermediate].copy_(gate.svh)
+@@ -3162,7 +3174,21 @@ def apply_exl3_batched_fat(
+         mcg_down = bool(getattr(down, "mcg", mcg_up))
+         mul1_down = bool(getattr(down, "mul1", mul1_up))
+ 
+-        if (
++        if native_any:
++            gate_h = h13
++            ext.had_r_128(h, gate_h, gate.suh, None, 1.0)
++            if distinct_suh:
++                ext.had_r_128(h, h, up.suh, None, 1.0)
++                up_h = h
++            else:
++                up_h = gate_h
++            native_c.exl3_fat_gemm(
++                gate_h, gate.trellis, scratch["g_tmp"][:n_rows], gate.svh, k_gate, mcg_gate, mul1_gate
++            )
++            native_c.exl3_fat_gemm(
++                up_h, up.trellis, scratch["u_tmp"][:n_rows], up.svh, k_up, mcg_up, mul1_up
++            )
++        elif (
+             not distinct_pack
+             and use_kernel
+             and k_up == 4
+@@ -3199,7 +3225,7 @@ def apply_exl3_batched_fat(
+                 ext.hgemm(h13, w13, gate_up)
+                 ext.had_r_128(gate_up, gate_up, None, svh13, 1.0)
+ 
+-        if distinct_pack:
++        if distinct_pack or native_any:
+             gate_out = scratch["g_tmp"][:n_rows]
+             up_out = scratch["u_tmp"][:n_rows]
+         else:
+@@ -3230,7 +3256,7 @@ def apply_exl3_batched_fat(
+ 
+         h2 = scratch["h2"][:n_rows]
+         ext.had_r_128(act_h, h2, down.suh, None, 1.0)
+-        if (
++        if native_any or (
+             not distinct_suh
+             and use_kernel
+             and k_down == 4
+-- 
+2.51.0
+

@@ -1,0 +1,356 @@
+From 11b94fcc0700e8b3213769394e7bf6e9142cc56e Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:01:24 -0500
+Subject: [PATCH] Mixed-K MoE decode on exl3_moe_coop, one launch per K group
+
+exl3_moe_coop (the decode MoE kernel) takes one (Kg, Ku, Kd) per launch and an expert range
+[lo, hi) whose pointer tables it indexes by (expert - lo), so mixed-K packs never used it.
+At load, experts of a mixed-K layer with <= 4 K groups (Kg == Ku, gated) are renumbered into
+K-tuple order: per-group pointer-table slices plus an original -> ordered id map. Decode-sized
+batches (<= VLLM_EXL3_COOP_SPLIT_MAX_TOKENS tokens, default 24 = spec-verify rows of 6
+requests) map router ids through it (routing unchanged) and run one coop launch per group; each
+launch adds the previous output through coop's sh_out, so every row is written once per launch.
+VLLM_EXL3_COOP_SPLIT=0 keeps mixedk.
+
+MiniMax-M3.1 2.15bpw per rank (2-3 K groups per layer):
+- vs mixedk: 1e-3 per layer on live weights; against an fp32 reference coop is the closer one
+  (6.4-6.5e-4 vs 6.6e-4, skewed routing up to 48 tokens; tests/gpu/bench_moe_coop_split.py);
+- kernel time: 1 token 323 -> 190 us, 4 tokens 885 -> 653 us, 8 tokens 1426 -> 1107 us;
+- served decode: c=1 23.5 -> 24.5 tok/s, c=4 52.5 -> 59.3 tok/s.
+---
+ src/vllm_exl3/exl3.py             |  86 +++++++++++++-
+ src/vllm_exl3/weight_snapshot.py  |   1 +
+ tests/gpu/bench_moe_coop_split.py | 191 ++++++++++++++++++++++++++++++
+ 3 files changed, 277 insertions(+), 1 deletion(-)
+ create mode 100644 tests/gpu/bench_moe_coop_split.py
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index 125935c..e2fe41c 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -136,6 +136,19 @@ def _temp_rows_fused() -> int:
+ TEMP_ROWS_FUSED = _temp_rows_fused()
+ _COOP = os.environ.get("VLLM_EXL3_COOP", "1") == "1"
+ _COOP_SLOTS_MAX = 256
++# Mixed-K layers with at most this many (Kg, Ku, Kd) groups run decode on one exl3_moe_coop
++# launch per group (VLLM_EXL3_COOP_SPLIT=0 keeps them on exl3_moe_mixedk).
++_COOP_SPLIT = os.environ.get("VLLM_EXL3_COOP_SPLIT", "1") == "1"
++_COOP_SPLIT_MAX_GROUPS = 4
++# Decode-sized batches only (spec verify rows of up to max_num_seqs requests). Measured on the
++# 2.15 pack: coop split vs mixedk 1e-3 per layer on live weights, and against an fp32
++# reference coop is the closer of the two (6.5e-4 vs 6.6e-4); larger batches keep mixedk.
++_COOP_SPLIT_MAX_TOKENS = int(os.environ.get("VLLM_EXL3_COOP_SPLIT_MAX_TOKENS", "24"))
++_COOP_PTR_NAMES = (
++    "gate_trellis", "gate_suh", "gate_svh",
++    "up_trellis", "up_suh", "up_svh",
++    "down_trellis", "down_suh", "down_svh",
++)
+ _COOP_ROWS_MAX = 32
+ try:
+     FAT_EXPERT_THRESHOLD = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD", "256")))
+@@ -2756,6 +2769,33 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+             _g_index[_t] = _gi
+         layer._exl3_k_group_ids = _g_ids
+         layer._exl3_group_index = _g_index
++        # Mixed-K decode on exl3_moe_coop: coop takes one (Kg, Ku, Kd) per launch and an
++        # expert range [lo, hi) whose pointer tables it indexes by (expert - lo). Experts
++        # are renumbered into K-tuple order (pointer tables permuted, router ids mapped
++        # through _exl3_coop_pid at decode; routing itself is unchanged) and each K group
++        # runs one launch; later launches add the earlier output through sh_out.
++        layer._exl3_coop_split = None
++        if (
++            _COOP_SPLIT
++            and not gateless
++            and len(layer._exl3_k_groups) <= _COOP_SPLIT_MAX_GROUPS
++            and all(_kt[0] == _kt[1] for _kt, _ in layer._exl3_k_groups)
++        ):
++            _corder: list[int] = []
++            _cranges: list[tuple[int, int, tuple[int, int, int]]] = []
++            for _k_tuple, _ids in layer._exl3_k_groups:
++                _cranges.append((len(_corder), len(_corder) + len(_ids), _k_tuple))
++                _corder.extend(_ids)
++            if len(_corder) == n_exp:
++                _cperm = torch.tensor(_corder, dtype=torch.long, device=device)
++                _cpacked = {_k: _v[_cperm].contiguous() for _k, _v in layer._exl3_ptrs.items()}
++                layer._exl3_coop_split = [
++                    (_lo, _hi, _kt, tuple(_cpacked[_n][_lo:_hi].contiguous() for _n in _COOP_PTR_NAMES))
++                    for _lo, _hi, _kt in _cranges
++                ]
++                _cpid = torch.full((n_exp + 1,), n_exp, dtype=torch.long, device=device)
++                _cpid[_cperm] = torch.arange(n_exp, dtype=torch.long, device=device)
++                layer._exl3_coop_pid = _cpid
+         # Packed K-group dispatch (VLLM_EXL3_MIXEDK_PACKED=1). Renumber the
+         # experts into K-tuple order so group gi owns one contiguous packed range
+         # [lo, hi) and every launch can share a single globally sorted token
+@@ -2799,7 +2839,7 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+         layer._exl3_k_groups = None
+ 
+     if (
+-        getattr(layer, "_exl3_coop_compat", False)
++        (getattr(layer, "_exl3_coop_compat", False) or getattr(layer, "_exl3_coop_split", None))
+         and device.type == "cuda"
+         and hidden % 128 == 0
+         and intermediate % 128 == 0
+@@ -3568,6 +3608,50 @@ def apply_exl3_fused_moe(
+             layer._exl3_last_apply = "coop"
+             return out
+ 
++    coop_split = getattr(layer, "_exl3_coop_split", None)
++    if (
++        _COOP
++        and coop_split
++        and tokens <= _COOP_SPLIT_MAX_TOKENS
++        and tokens * topk <= _COOP_SLOTS_MAX
++        and tokens <= FAT_EXPERT_THRESHOLD
++        and tokens <= TEMP_ROWS_FUSED
++        and hasattr(exllamav3_ext, "exl3_moe_coop")
++    ):
++        flags = getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS)
++        mcg, mul1 = bool(flags[0]), bool(flags[1])
++        inter_dim = int(temps[2].shape[-1])
++        if (
++            all(bool(flags[i]) == mcg and bool(flags[i + 1]) == mul1 for i in range(0, 6, 2))
++            and hidden % 128 == 0
++            and inter_dim % 128 == 0
++        ):
++            dev = x2d.device
++            # Router ids -> K-tuple-ordered ids; the n_exp sentinel stays out of every range.
++            sel_p = layer._exl3_coop_pid.index_select(0, local.reshape(-1).long()).reshape(tokens, topk).contiguous()
++            rw_c = weights.reshape(tokens, topk).to(dtype=torch.float16).contiguous()
++            had_g, had_u, gu_g, gu_u, act_out, d_out, ctr = _get_coop_temps(dev, hidden, inter_dim, tokens)
++            moe_act = getattr(layer, "_exl3_moe_act", None)
++            if moe_act is None:
++                moe_act = resolve_moe_act(layer)
++            act_limit = float(limit) if (limit is not None and limit > 0) else 0.0
++            prev = None
++            for lo, hi, (kg, ku, kd), gptrs in coop_split:
++                # Every row is written: rows with no slot in [lo, hi) get prev (or zeros).
++                cur = torch.empty(tokens, hidden, dtype=torch.float32, device=dev)
++                exllamav3_ext.exl3_moe_coop(
++                    xh, sel_p, rw_c, int(lo), int(hi), hidden,
++                    *gptrs,
++                    None, None, None,
++                    int(kg), int(ku), int(kd), mcg, mul1, moe_act, act_limit,
++                    True,
++                    had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, cur,
++                    prev, None,
++                )
++                prev = cur
++            layer._exl3_last_apply = "coop_split"
++            return prev
++
+     flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
+     flat_weight = weights.reshape(-1).to(dtype=torch.float16)
+     # scatter_add stays on GPU. torch.bincount can host-stage and break CUDA graphs.
+diff --git a/src/vllm_exl3/weight_snapshot.py b/src/vllm_exl3/weight_snapshot.py
+index 4cb8180..0325ec1 100644
+--- a/src/vllm_exl3/weight_snapshot.py
++++ b/src/vllm_exl3/weight_snapshot.py
+@@ -61,6 +61,7 @@ APPLY_ONLY_ENV = frozenset({
+     "VLLM_EXL3_FAT_GROUPED", "VLLM_EXL3_FP8_PREFILL", "VLLM_EXL3_FP8_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_FP8_PREFILL_SKIP", "VLLM_EXL3_BF16_PREFILL", "VLLM_EXL3_BF16_PREFILL_MIN_ROWS",
+     "VLLM_EXL3_MIXEDK_M64_MIN_TOKENS",
++    "VLLM_EXL3_COOP_SPLIT", "VLLM_EXL3_COOP_SPLIT_MAX_TOKENS",
+ })
+ 
+ try:
+diff --git a/tests/gpu/bench_moe_coop_split.py b/tests/gpu/bench_moe_coop_split.py
+new file mode 100644
+index 0000000..bb12609
+--- /dev/null
++++ b/tests/gpu/bench_moe_coop_split.py
+@@ -0,0 +1,191 @@
++"""Decode MoE: exl3_moe_mixedk vs two exl3_moe_coop launches split by down-K (run in the image).
++
++Note: coop indexes its pointer tables by (expert - min_expert), so each launch gets tables
++sliced from its range start.
++
++2.15-lane per-rank geometry; experts ordered so the 16 K3-down experts are ids 112..127.
++coop A covers [0,112) at (Kg,Ku,Kd)=(2,2,2), coop B [112,128) at (2,2,3); their outputs are
++summed and compared with mixedk on the same routing."""
++import time
++import torch
++from exllamav3.ext import exllamav3_ext as ext
++
++dev = "cuda"
++torch.manual_seed(0)
++H, I, E, TOPK, SPLIT = 6144, 1536, 128, 4, 112
++import os
++kd = torch.tensor([2] * SPLIT + [3 if os.environ.get("UNIFORM") != "1" else 2] * (E - SPLIT), dtype=torch.int32)
++
++
++def tensors(k_in, k_out, K):
++    tr = torch.randint(-32768, 32767, (k_in // 16, k_out // 16, 16 * K), dtype=torch.int16, device=dev)
++    suh = torch.where(torch.rand(k_in, device=dev) < 0.5, -1.0, 1.0).half()
++    svh = (torch.rand(k_out, device=dev) * 0.02 + 0.01).half()
++    return tr, suh, svh
++
++
++ex = [{"gate": tensors(H, I, 2), "up": tensors(H, I, 2), "down": tensors(I, H, int(kd[e]))} for e in range(E)]
++P = [torch.tensor([ex[e][p][i].data_ptr() for e in range(E)], dtype=torch.int64, device=dev)
++     for p in ("gate", "up", "down") for i in range(3)]
++KG = torch.full((E,), 2, dtype=torch.int32, device=dev); KD = kd.to(dev)
++conc = int(ext.exl3_moe_max_concurrency(0)); ROWS = 64
++temps = [torch.empty((conc, ROWS, H), dtype=torch.half, device=dev) for _ in range(2)] + \
++        [torch.empty((conc, ROWS, I), dtype=torch.half, device=dev) for _ in range(2)]
++SLOTS = 256
++had_g = torch.empty((SLOTS, H), dtype=torch.half, device=dev); had_u = torch.empty_like(had_g)
++gu_g = torch.empty((SLOTS, 1, I), dtype=torch.half, device=dev); gu_u = torch.empty_like(gu_g); act_out = torch.empty_like(gu_g)
++d_out = torch.empty((SLOTS, 1, H), dtype=torch.float32, device=dev)
++
++
++def timeit(fn, n=200):
++    fn(); torch.cuda.synchronize(); t = time.perf_counter()
++    for _ in range(n): fn()
++    torch.cuda.synchronize(); return (time.perf_counter() - t) / n * 1e6
++
++
++for tokens in (1, 4, 8):
++    x = (torch.randn(tokens, H, device=dev) * 0.5).half()
++    sel = torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(tokens)])
++    w = (torch.rand(tokens, TOPK, device=dev) * 0.5)
++    flat = sel.reshape(-1); order = flat.argsort(stable=True)
++    ts = torch.arange(tokens, device=dev).repeat_interleave(TOPK)[order]; ws = w.reshape(-1)[order].half()
++    cnt = torch.zeros(E + 1, dtype=torch.long, device=dev); cnt.scatter_add_(0, flat.long(), torch.ones_like(flat, dtype=torch.long))
++    out_mk = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++
++    def mk():
++        out_mk.zero_()
++        ext.exl3_moe_mixedk(x, out_mk, cnt, ts, ws, *temps, 3, KG, KG, KD, *P, False, True, False, True, False, True,
++                            7.0, -1, None, None, 1, ROWS, 16, 3, None)
++    ctr = torch.zeros(SLOTS * (I // 128) + tokens * (H // 128) + 2 * SLOTS + 3, dtype=torch.int32, device=dev)
++    ctr2 = torch.zeros_like(ctr)
++    oa = torch.empty(tokens, H, dtype=torch.float32, device=dev); ob = torch.empty_like(oa)
++    sel_c = sel.to(torch.int64).contiguous(); rw_c = w.half().contiguous()
++
++    def coop(lo, hi, kdv, o, c):
++        # Pointer tables are indexed by (expert - lo): pass them sliced from lo.
++        ext.exl3_moe_coop(x, sel_c, rw_c, lo, hi, H, *[t[lo:hi].contiguous() for t in P], None, None, None, 2, 2, kdv,
++                          False, True, 3, 7.0, True,
++                          had_g, had_u, gu_g, gu_u, act_out, d_out, c, o, None, None)
++
++    def split():
++        oa.zero_(); ob.zero_()
++        coop(0, SPLIT, 2, oa, ctr)
++        coop(SPLIT, E, 3, ob, ctr2)
++    of = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++    if os.environ.get("UNIFORM") == "1":
++        ctr3 = torch.zeros_like(ctr)
++        coop(0, E, 2, of, ctr3)
++    mk(); split(); torch.cuda.synchronize()
++    if os.environ.get("UNIFORM") == "1":
++        print(f"  full-range coop vs mixedk rel {((of - out_mk).norm() / out_mk.norm()).item():.1e}")
++    ref = out_mk.clone(); got = oa + ob
++    rel = ((got - ref).norm() / ref.norm()).item()
++    print(f"tokens={tokens} distinct={len(torch.unique(sel))}: mixedk {timeit(mk):7.1f} us | coop x2 {timeit(split):7.1f} us | "
++          f"rel(coop, mixedk) {rel:.1e}")
++
++# Robustness: many split calls with changing token counts and routings, interleaved with
++# full-range-style launches on other counter buffers, each checked against mixedk.
++worst = 0.0
++for it in range(30):
++    tokens = [1, 2, 3, 4, 8, 5][it % 6]
++    x = (torch.randn(tokens, H, device=dev) * 0.5).half()
++    sel = torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(tokens)])
++    w = (torch.rand(tokens, TOPK, device=dev) * 0.5)
++    flat = sel.reshape(-1); order = flat.argsort(stable=True)
++    ts = torch.arange(tokens, device=dev).repeat_interleave(TOPK)[order]; ws = w.reshape(-1)[order].half()
++    cnt = torch.zeros(E + 1, dtype=torch.long, device=dev); cnt.scatter_add_(0, flat.long(), torch.ones_like(flat, dtype=torch.long))
++    ref = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++    ext.exl3_moe_mixedk(x, ref, cnt, ts, ws, *temps, 3, KG, KG, KD, *P, False, True, False, True, False, True,
++                        7.0, -1, None, None, 1, ROWS, 16, 3, None)
++    sel_c = sel.to(torch.int64).contiguous(); rw_c = w.half().contiguous()
++    ctr = torch.zeros(SLOTS * (I // 128) + tokens * (H // 128) + 2 * SLOTS + 3, dtype=torch.int32, device=dev)
++    ctr2 = torch.zeros_like(ctr)
++    oa = torch.zeros(tokens, H, dtype=torch.float32, device=dev); ob = torch.zeros_like(oa)
++    for lo, hi, kdv, o, c in ((0, SPLIT, 2, oa, ctr), (SPLIT, E, 3, ob, ctr2)):
++        ext.exl3_moe_coop(x, sel_c, rw_c, lo, hi, H, *[t[lo:hi].contiguous() for t in P], None, None, None, 2, 2, kdv,
++                          False, True, 3, 7.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, c, o, None, None)
++    torch.cuda.synchronize()
++    worst = max(worst, ((oa + ob - ref).norm() / ref.norm()).item())
++print(f"robustness: 30 split calls, worst rel vs mixedk {worst:.1e} {'OK' if worst < 3e-3 else 'FAIL'}")
++
++# Serving pattern: counters cached per token count and reused across calls, and an unrelated
++# coop launch (another layer) between splits.
++ctr_cache = {}
++worst = 0.0
++for it in range(30):
++    tokens = [1, 4, 8][it % 3]
++    key = tokens
++    if key not in ctr_cache:
++        n = SLOTS * (I // 128) + tokens * (H // 128) + 2 * SLOTS + 3
++        ctr_cache[key] = (torch.zeros(n, dtype=torch.int32, device=dev), torch.zeros(n, dtype=torch.int32, device=dev))
++    ca, cb = ctr_cache[key]
++    # unrelated launch on the same temps and counters
++    xj = (torch.randn(tokens, H, device=dev) * 0.5).half()
++    sj = torch.stack([torch.randperm(SPLIT, device=dev)[:TOPK] for _ in range(tokens)]).to(torch.int64)
++    junk = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++    ext.exl3_moe_coop(xj, sj, torch.rand(tokens, TOPK, device=dev).half(), 0, SPLIT, H, *[t[0:SPLIT].contiguous() for t in P],
++                      None, None, None, 2, 2, 2, False, True, 3, 7.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, ca, junk, None, None)
++    x = (torch.randn(tokens, H, device=dev) * 0.5).half()
++    sel = torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(tokens)])
++    w = (torch.rand(tokens, TOPK, device=dev) * 0.5)
++    flat = sel.reshape(-1); order = flat.argsort(stable=True)
++    ts = torch.arange(tokens, device=dev).repeat_interleave(TOPK)[order]; ws = w.reshape(-1)[order].half()
++    cnt = torch.zeros(E + 1, dtype=torch.long, device=dev); cnt.scatter_add_(0, flat.long(), torch.ones_like(flat, dtype=torch.long))
++    ref = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++    ext.exl3_moe_mixedk(x, ref, cnt, ts, ws, *temps, 3, KG, KG, KD, *P, False, True, False, True, False, True,
++                        7.0, -1, None, None, 1, ROWS, 16, 3, None)
++    sel_c = sel.to(torch.int64).contiguous(); rw_c = w.half().contiguous()
++    oa = torch.zeros(tokens, H, dtype=torch.float32, device=dev); ob = torch.zeros_like(oa)
++    for lo, hi, kdv, o, c in ((0, SPLIT, 2, oa, ca), (SPLIT, E, 3, ob, cb)):
++        ext.exl3_moe_coop(x, sel_c, rw_c, lo, hi, H, *[t[lo:hi].contiguous() for t in P], None, None, None, 2, 2, kdv,
++                          False, True, 3, 7.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, c, o, None, None)
++    torch.cuda.synchronize()
++    worst = max(worst, ((oa + ob - ref).norm() / ref.norm()).item())
++print(f"serving pattern: 30 split calls, reused counters, worst rel vs mixedk {worst:.1e} {'OK' if worst < 3e-3 else 'FAIL'}")
++
++# Accuracy against an fp32 reference (fp16-reconstructed trellis values, fp32 GEMMs).
++def had(t, pre=None, post=None):
++    t = t.float().contiguous()
++    ext.had_r_128(t, t, pre, post, 1.0)
++    return t
++
++
++for tokens in (4, 16, 48):
++    x = (torch.randn(tokens, H, device=dev) * 0.5).half()
++    pop = torch.distributions.LogNormal(0, 1.0).sample((E,))
++    sel = torch.multinomial(pop.repeat(tokens, 1), TOPK, replacement=False).to(dev)  # skewed, real-like
++    w = (torch.rand(tokens, TOPK, device=dev) * 0.5 + 0.2)
++    ref = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++    for t_ in range(tokens):
++        for k in range(TOPK):
++            e = int(sel[t_, k])
++            xe = x[t_:t_ + 1].float()
++            outs = []
++            for p in ("gate", "up"):
++                tr, suh, svh = ex[e][p]
++                W = torch.empty(H, I, dtype=torch.half, device=dev)
++                ext.reconstruct(W, tr, 2, False, True)
++                outs.append(had(had(xe * suh.float()) @ W.float(), None, svh))
++            g, u = outs
++            g = g.clamp(max=7.0); u = u.clamp(min=-7.0, max=7.0)
++            a = g * torch.sigmoid(1.702 * g) * (u + 1.0)
++            tr, suh, svh = ex[e]["down"]
++            W = torch.empty(I, H, dtype=torch.half, device=dev)
++            ext.reconstruct(W, tr, int(kd[e]), False, True)
++            ref[t_] += float(w[t_, k].half()) * had(had(a * suh.float()) @ W.float(), None, svh)[0]
++    flat = sel.reshape(-1); order = flat.argsort(stable=True)
++    ts = torch.arange(tokens, device=dev).repeat_interleave(TOPK)[order]; ws = w.reshape(-1)[order].half()
++    cnt = torch.zeros(E + 1, dtype=torch.long, device=dev); cnt.scatter_add_(0, flat.long(), torch.ones_like(flat, dtype=torch.long))
++    mk_out = torch.zeros(tokens, H, dtype=torch.float32, device=dev)
++    ext.exl3_moe_mixedk(x, mk_out, cnt, ts, ws, *temps, 3, KG, KG, KD, *P, False, True, False, True, False, True,
++                        7.0, -1, None, None, 1, ROWS, 16, 3, None)
++    sel_c = sel.to(torch.int64).contiguous(); rw_c = w.half().contiguous()
++    ctr = torch.zeros(SLOTS * (I // 128) + tokens * (H // 128) + 2 * SLOTS + 3, dtype=torch.int32, device=dev)
++    oa = torch.empty(tokens, H, dtype=torch.float32, device=dev); ob = torch.empty_like(oa)
++    ext.exl3_moe_coop(x, sel_c, rw_c, 0, SPLIT, H, *[t[0:SPLIT].contiguous() for t in P], None, None, None, 2, 2, 2,
++                      False, True, 3, 7.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, oa, None, None)
++    ext.exl3_moe_coop(x, sel_c, rw_c, SPLIT, E, H, *[t[SPLIT:E].contiguous() for t in P], None, None, None, 2, 2, 3,
++                      False, True, 3, 7.0, True, had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, ob, oa, None)
++    torch.cuda.synchronize()
++    r = lambda a: ((a - ref).norm() / ref.norm()).item()
++    print(f"skewed tokens={tokens} distinct={len(torch.unique(sel))}: vs fp32 ref mixedk {r(mk_out):.2e} | coop split (sh_out chain) {r(ob):.2e}")
+-- 
+2.51.0
+

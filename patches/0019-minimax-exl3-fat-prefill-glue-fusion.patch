@@ -1,0 +1,1015 @@
+From 026b15af269fe23d32939f1b300dcf0be858a87d Mon Sep 17 00:00:00 2001
+From: Justin Casey <4348807+justincasey@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:30:14 -0500
+Subject: [PATCH] Fat-tier MoE glue: one token pass for the gate/up input
+ Hadamards, activation in the up epilogue
+
+- exl3_had_r_128_token_gate_up: each token's row of x (bf16 or fp16) is read
+  once, rounded to fp16 as x.half() does, and written pre-scaled by the
+  expert's gate/up suh and Hadamard-transformed to every fat route row; it can
+  also zero the fp32 routed accumulator. Replaces x.half(), the zero fill and
+  two gathered exl3_had_r_128_grouped launches.
+- exl3_fat_gemm_grouped_act: the up projection's epilogue reads the gate rows
+  and applies clamp + activation + fp16 round + down-suh Hadamard, replacing
+  exl3_act_had_r_128_grouped and the fp32 up buffer.
+- apply_exl3_fused_moe: per-expert counts read to the host once; when every
+  routed expert is fat the layer goes straight to the fat tier (no fp16 copy of
+  x, no zero fill, no empty standard launch). The fp16 copy is made lazily.
+
+Bit-identical intermediates (tests in test_fat_gemm_grouped.py); routed output
+differs only by atomic order. Real 16K-chunk routing, 57 layers: 78.9 -> 72.5 ms
+per layer (tests/gpu/bench_fat_glue.py).
+---
+ CHANGELOG.md                       |  12 ++
+ csrc/bindings.cpp                  |   2 +
+ csrc/exl3_fat_gemm.cu              | 237 ++++++++++++++++++++++++++---
+ csrc/exl3_fat_gemm.cuh             |   9 ++
+ src/vllm_exl3/exl3.py              | 170 +++++++++++++--------
+ tests/gpu/bench_fat_glue.py        | 162 ++++++++++++++++++++
+ tests/gpu/test_fat_gemm_grouped.py |  60 ++++++++
+ 7 files changed, 572 insertions(+), 80 deletions(-)
+ create mode 100644 tests/gpu/bench_fat_glue.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b524aa9..4fc276f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -62,6 +62,18 @@
+ 
+ ### Changed
+ 
++- Fat-tier MoE glue (prefill): the gate and up input Hadamards run as one pass over the tokens
++  (`exl3_had_r_128_token_gate_up`: each token's bf16 row is read once and written, pre-scaled per
++  expert, to all its fat route rows; it also zeroes the fp32 routed accumulator), and the up
++  projection's epilogue applies clamp + activation + fp16 round + down-input Hadamard
++  (`exl3_fat_gemm_grouped_act`), replacing the act pass and the fp32 up buffer. When every routed
++  expert is fat (`VLLM_EXL3_FAT_THRESHOLD_PREFILL=0`) the layer skips the fp16 copy of x, the
++  separate zero fill and the empty standard launch; the per-expert row counts are read once.
++  Every intermediate is bit-identical to before; the routed output differs only by atomic
++  accumulation order (max |diff| 2.4e-7). Real MiniMax-M3.1 16K-chunk routing, 57 layers, 2.15
++  pack shapes: 78.9 -> 72.5 ms per layer (token pass -4.3 ms, activation epilogue -2.1 ms);
++  `tests/gpu/bench_fat_glue.py`.
++
+ - Grouped fat-expert GEMM (`exl3_fat_gemm_grouped`): A rows and trellis words now stream
+   global -> shared with `cp.async` through a 5-stage pipeline (4 for K >= 4) of 32-wide K
+   stages instead of a register-staged 64-wide prefetch, with one barrier per stage placed so
+diff --git a/csrc/bindings.cpp b/csrc/bindings.cpp
+index 0a6772b..6457ff8 100644
+--- a/csrc/bindings.cpp
++++ b/csrc/bindings.cpp
+@@ -264,6 +264,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("exl3_had_rows_bf16", &exl3_had_rows_bf16, "Row/weight rescale + output Hadamard (svh), bf16 in, fp32/bf16/fp16 out (column slice ok)");
+     m.def("exl3_fat_gemm_grouped", &exl3_fat_gemm_grouped, "Native EXL3 fat GEMM, one launch per expert group");
+     m.def("exl3_had_r_128_grouped", &exl3_had_r_128_grouped, "Pre-scaled Hadamard with a scale vector per row group, optional row gather");
++    m.def("exl3_fat_gemm_grouped_act", &exl3_fat_gemm_grouped_act, "Grouped fat up projection with the activation + down-input Hadamard epilogue");
++    m.def("exl3_had_r_128_token_gate_up", &exl3_had_r_128_token_gate_up, "Fat-tier gate/up input Hadamards in one pass over the tokens (bf16/fp16 x), optional fp32 zero fill");
+     m.def("exl3_act_had_r_128_grouped", &exl3_act_had_r_128_grouped, "Fused MoE clamp + activation + fp16 round + pre-scaled Hadamard per row group");
+     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
+           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
+diff --git a/csrc/exl3_fat_gemm.cu b/csrc/exl3_fat_gemm.cu
+index 2fa02f1..dd321cb 100644
+--- a/csrc/exl3_fat_gemm.cu
++++ b/csrc/exl3_fat_gemm.cu
+@@ -11,6 +11,8 @@
+ // tensor-mixed-K packs (K2/K3 experts) take the fused path too.
+ 
+ #include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <type_traits>
+ #include <c10/cuda/CUDAGuard.h>
+ #include <ATen/cuda/CUDAContext.h>
+ 
+@@ -235,6 +237,24 @@ __device__ __forceinline__ void fat_cp_wait()
+     asm volatile("cp.async.wait_group %0;\n" :: "n"(n) : "memory");
+ }
+ 
++// had_hf_r_128_inner<true, false> with the 128-column chunk index explicit (it reads blockIdx.y):
++// lane holds elements 4 lane .. 4 lane + 3 of the chunk; scale is the full half[cols] vector.
++__device__ __forceinline__ void had_h4_pre_scaled_store(
++    half2 v0, half2 v1, const half* __restrict__ scale, int chunk, half* __restrict__ out, float r_scale, int lane)
++{
++    const half4 s = reinterpret_cast<const half4*>(scale)[chunk * 32 + lane];
++    v0 = __hmul2(v0, s.x);
++    v1 = __hmul2(v1, s.y);
++    const float a0 = __low2float(v0), a1 = __high2float(v0), a2 = __low2float(v1), a3 = __high2float(v1);
++    const float s0 = a0 + a1, d0 = a0 - a1, s1 = a2 + a3, d1 = a2 - a3;
++    float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
++    shuffle_had_f4x32(h0, h1, h2, h3, lane);
++    half4 o;
++    o.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
++    o.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
++    reinterpret_cast<half4*>(out)[lane] = o;
++}
++
+ // Grouped kernel. Warp w owns 16-column N-block w for all 128 rows and dequantizes its
+ // trellis tile in registers (each tile once per CTA). A rows and trellis words go
+ // global -> shared with cp.async: STAGES buffers of FAT_G_KSUB 16-wide sub-blocks, STAGES - 2
+@@ -242,7 +262,12 @@ __device__ __forceinline__ void fat_cp_wait()
+ // stage's last sub-block: its MMAs read resident data and issue first, then the next copy and
+ // the next stage's first dequant run while they drain. The per-element accumulation order is
+ // the plain K order of the per-expert kernel, so outputs match it bit for bit.
+-template <int K, int CB, bool scatter>
++// ACT (non-scatter only): instead of storing the fp32 rows, the epilogue finishes the expert MLP's
++// middle step for them, exactly as act_had_r_128_grouped_kernel would on the stored rows: with
++// act_gate's fp32 rows (the gate projection, same row index and width) it clamps, applies the
++// activation, rounds to fp16, pre-scales by the group's act_scale (the down suh) and writes the
++// 128-wide Hadamard into act_out (fp16, same shape). One FAT_TILE_N column tile is one chunk.
++template <int K, int CB, bool scatter, bool ACT = false>
+ __global__ __launch_bounds__(FAT_THREADS, 2)
+ void exl3_fat_gemm_grouped_kernel(
+     const half* __restrict__ a,
+@@ -253,8 +278,16 @@ void exl3_fat_gemm_grouped_kernel(
+     const int64_t* __restrict__ token_idx,
+     const half* __restrict__ route_weight,
+     int size_k,
+-    int size_n)
++    int size_n,
++    const float* __restrict__ act_gate,
++    half* __restrict__ act_out,
++    const int64_t* __restrict__ act_scale_ptrs,
++    float act_limit,
++    float act_alpha,
++    int act_kind)
+ {
++    static_assert(!(ACT && scatter), "the activation epilogue takes a plain (row-aligned) output");
++    static_assert(FAT_TILE_N == 128, "one output tile is one Hadamard chunk");
+     constexpr int STAGES = fat_g_stages<K>();
+     constexpr int KSUB = FAT_G_KSUB;
+     constexpr int WARPS = FAT_THREADS / 32;
+@@ -461,6 +494,30 @@ void exl3_fat_gemm_grouped_kernel(
+                 asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+                              :: "l"(dst), "f"(v.x * w), "f"(v.y * w), "f"(v.z * w), "f"(v.w * w) : "memory");
+             }
++            else if constexpr (ACT)
++            {
++                const size_t off = static_cast<size_t>(m_base + mp * 16 + row) * size_n + n_base;
++                const float4 g4 = *reinterpret_cast<const float4*>(act_gate + off + col_out);
++                float gv[4] = {g4.x, g4.y, g4.z, g4.w};
++                float uv[4] = {v.x, v.y, v.z, v.w};
++                half h[4];
++                #pragma unroll
++                for (int i = 0; i < 4; ++i)
++                {
++                    if (act_limit > 0.0f)
++                    {
++                        gv[i] = fminf(gv[i], act_limit);
++                        uv[i] = fminf(fmaxf(uv[i], -act_limit), act_limit);
++                    }
++                    const float act = act_kind == 1
++                        ? gv[i] * (1.0f / (1.0f + __expf(-act_alpha * gv[i]))) * (uv[i] + 1.0f)
++                        : gv[i] * (1.0f / (1.0f + __expf(-gv[i]))) * uv[i];
++                    h[i] = __float2half_rn(act);
++                }
++                had_h4_pre_scaled_store(__halves2half2(h[0], h[1]), __halves2half2(h[2], h[3]),
++                                        reinterpret_cast<const half*>(act_scale_ptrs[g]), n_base / 128,
++                                        act_out + off, 0.088388347648f, lane);
++            }
+             else
+             {
+                 *reinterpret_cast<float4*>(out + static_cast<size_t>(m_base + mp * 16 + row) * size_n + n_base + col_out) = v;
+@@ -490,6 +547,63 @@ void had_hf_r_128_grouped_kernel(
+     had_hf_r_128_inner<true, false>(input_ptr, output_ptr, scale, r_scale);
+ }
+ 
++// Gate and up input transforms of the fat tier in one pass over the tokens: token t's 128-column
++// chunk is read once (bf16 or fp16; bf16 is rounded to fp16 first, as x.half() does) and written,
++// pre-scaled by the expert's suh and Hadamard-transformed, to every fat row r = token_rows[t, j]
++// (-1: no fat route) of gate_out (gate suh) and up_out (up suh; null when the experts share one
++// suh). zero_out, if set, gets the chunk's fp32 zeros (the routed output accumulator). Per element
++// the same operations as had_hf_r_128_grouped_kernel on x.half(): bit-identical rows.
++template <typename T>
++__global__ __launch_bounds__(128)
++void had_r_128_token_gate_up_kernel(
++    const T* __restrict__ x,
++    const int* __restrict__ token_rows,
++    const int topk,
++    const int* __restrict__ row_group,
++    const int64_t* __restrict__ gate_scale_ptrs,
++    const int64_t* __restrict__ up_scale_ptrs,
++    half* __restrict__ gate_out,
++    half* __restrict__ up_out,
++    float* __restrict__ zero_out,
++    const int cols,
++    const float r_scale)
++{
++    const int lane = threadIdx.x & 31;
++    const int chunk = blockIdx.y * 4 + threadIdx.x / 32;
++    if (chunk * 128 >= cols) return;
++    const size_t t = blockIdx.x;
++    const size_t off = t * cols + chunk * 128 + lane * 4;
++    half2 v0, v1;
++    if constexpr (std::is_same_v<T, half>)
++    {
++        const half4 h = *reinterpret_cast<const half4*>(x + off);
++        v0 = h.x;
++        v1 = h.y;
++    }
++    else
++    {
++        const uint2 raw = *reinterpret_cast<const uint2*>(x + off);
++        const __nv_bfloat162 b0 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
++        const __nv_bfloat162 b1 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
++        v0 = __floats2half2_rn(__low2float(b0), __high2float(b0));
++        v1 = __floats2half2_rn(__low2float(b1), __high2float(b1));
++    }
++    if (zero_out)
++        *reinterpret_cast<float4*>(zero_out + off) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    for (int j = 0; j < topk; ++j)
++    {
++        const int r = token_rows[t * topk + j];
++        if (r < 0) continue;
++        const int g = row_group[r];
++        const size_t dst = static_cast<size_t>(r) * cols + chunk * 128;
++        had_h4_pre_scaled_store(v0, v1, reinterpret_cast<const half*>(gate_scale_ptrs[g]), chunk, gate_out + dst,
++                                r_scale, lane);
++        if (up_out)
++            had_h4_pre_scaled_store(v0, v1, reinterpret_cast<const half*>(up_scale_ptrs[g]), chunk, up_out + dst,
++                                    r_scale, lane);
++    }
++}
++
+ // Fused MoE activation + down-projection input transform over expert-sorted rows:
+ // clamp (limit > 0), act (0: SiLU gate*sigmoid(gate)*up, 1: SwiGLU-OAI
+ // gate*sigmoid(alpha*gate)*(up+1)), round to fp16, then the pre-scaled 128-wide
+@@ -627,10 +741,21 @@ void launch(int64_t K, bool mcg, bool mul1, at::Tensor a, at::Tensor packed, at:
+ }
+ 
+ 
+-template <int K, int CB, bool scatter>
++// Activation epilogue of the grouped launch (see exl3_fat_gemm_grouped_kernel's ACT).
++struct FatActArgs
++{
++    const float* gate;
++    half* out;
++    const int64_t* scale_ptrs;
++    float limit;
++    float alpha;
++    int kind;
++};
++
++template <int K, int CB, bool scatter, bool ACT>
+ void launch_grouped_k(
+     at::Tensor a, at::Tensor packed_ptrs, at::Tensor out, at::Tensor svh_ptrs, at::Tensor row_bounds,
+-    at::Tensor token_idx, at::Tensor route_weight, int64_t size_n, int64_t max_rows)
++    at::Tensor token_idx, at::Tensor route_weight, int64_t size_n, int64_t max_rows, const FatActArgs& act)
+ {
+     const at::cuda::OptionalCUDAGuard device_guard(a.device());
+     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+@@ -639,33 +764,34 @@ void launch_grouped_k(
+     dim3 block(FAT_THREADS);
+     dim3 grid(static_cast<int>(size_n) / FAT_TILE_N, (static_cast<int>(max_rows) + FAT_TILE_M - 1) / FAT_TILE_M, groups);
+     const size_t shared = static_cast<size_t>(fat_g_stages<K>()) * fat_g_stage_bytes<K>();
+-    exl3_fat_gemm_grouped_kernel<K, CB, scatter><<<grid, block, shared, stream>>>(
++    exl3_fat_gemm_grouped_kernel<K, CB, scatter, ACT><<<grid, block, shared, stream>>>(
+         reinterpret_cast<const half*>(a.data_ptr()),
+         reinterpret_cast<const int64_t*>(packed_ptrs.data_ptr()),
+-        reinterpret_cast<float*>(out.data_ptr()),
++        ACT ? nullptr : reinterpret_cast<float*>(out.data_ptr()),
+         reinterpret_cast<const int64_t*>(svh_ptrs.data_ptr()),
+         reinterpret_cast<const int*>(row_bounds.data_ptr()),
+         scatter ? reinterpret_cast<const int64_t*>(token_idx.data_ptr()) : nullptr,
+         scatter ? reinterpret_cast<const half*>(route_weight.data_ptr()) : nullptr,
+         size_k,
+-        static_cast<int>(size_n));
++        static_cast<int>(size_n),
++        act.gate, act.out, act.scale_ptrs, act.limit, act.alpha, act.kind);
+     cuda_check(cudaPeekAtLastError());
+ }
+ 
+-template <int CB, bool scatter>
++template <int CB, bool scatter, bool ACT = false>
+ void launch_grouped_cb(int64_t K, at::Tensor a, at::Tensor pp, at::Tensor out, at::Tensor sp, at::Tensor rs,
+-                       at::Tensor ti, at::Tensor rw, int64_t n, int64_t mr)
++                       at::Tensor ti, at::Tensor rw, int64_t n, int64_t mr, const FatActArgs& act = {})
+ {
+     switch (K)
+     {
+-        case 1: launch_grouped_k<1, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
+-        case 2: launch_grouped_k<2, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
+-        case 3: launch_grouped_k<3, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
+-        case 4: launch_grouped_k<4, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
+-        case 5: launch_grouped_k<5, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
+-        case 6: launch_grouped_k<6, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
+-        case 7: launch_grouped_k<7, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
+-        case 8: launch_grouped_k<8, CB, scatter>(a, pp, out, sp, rs, ti, rw, n, mr); break;
++        case 1: launch_grouped_k<1, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
++        case 2: launch_grouped_k<2, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
++        case 3: launch_grouped_k<3, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
++        case 4: launch_grouped_k<4, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
++        case 5: launch_grouped_k<5, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
++        case 6: launch_grouped_k<6, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
++        case 7: launch_grouped_k<7, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
++        case 8: launch_grouped_k<8, CB, scatter, ACT>(a, pp, out, sp, rs, ti, rw, n, mr, act); break;
+         default: TORCH_CHECK(false, "exl3_fat_gemm_grouped: unsupported K ", K);
+     }
+ }
+@@ -753,6 +879,39 @@ void exl3_fat_gemm_grouped(
+     }
+ }
+ 
++// Grouped up projection with the activation epilogue: for every row of the launch, the up rows
++// computed here and gate's fp32 rows (same index, width size_n) give
++// down_in[r] = had128(down_suh[g] * fp16(act(clamp(gate[r]), clamp(up[r])))), exactly what
++// exl3_fat_gemm_grouped into an fp32 up buffer followed by exl3_act_had_r_128_grouped computes.
++void exl3_fat_gemm_grouped_act(
++    at::Tensor a, at::Tensor packed_ptrs, at::Tensor gate, at::Tensor svh_ptrs, at::Tensor row_bounds,
++    int64_t K, bool mcg, bool mul1, int64_t size_n, int64_t max_rows,
++    at::Tensor down_in, at::Tensor down_scale_ptrs, double limit, double alpha, int64_t act)
++{
++    TORCH_CHECK(a.is_cuda() && a.scalar_type() == at::kHalf && a.is_contiguous() && a.dim() == 2,
++                "a must be a contiguous float16 CUDA matrix");
++    TORCH_CHECK(gate.scalar_type() == at::kFloat && gate.is_contiguous() && gate.dim() == 2 &&
++                gate.size(0) == a.size(0) && gate.size(1) == size_n, "gate must be contiguous float32 [rows, size_n]");
++    TORCH_CHECK(down_in.scalar_type() == at::kHalf && down_in.is_contiguous() && down_in.sizes() == gate.sizes(),
++                "down_in must be contiguous float16 like gate");
++    TORCH_CHECK(packed_ptrs.scalar_type() == at::kLong && svh_ptrs.scalar_type() == at::kLong &&
++                down_scale_ptrs.scalar_type() == at::kLong && packed_ptrs.numel() == svh_ptrs.numel() &&
++                down_scale_ptrs.numel() == packed_ptrs.numel(), "pointer tables must be int64 of equal length");
++    TORCH_CHECK(row_bounds.scalar_type() == at::kInt && row_bounds.numel() == 2 * packed_ptrs.numel(),
++                "row_bounds must be int32 [2 * groups] (start, end) pairs");
++    TORCH_CHECK(K >= 1 && K <= 8, "K 1..8");
++    TORCH_CHECK(!(mcg && mul1), "mcg and mul1 are exclusive");
++    TORCH_CHECK(act == 0 || act == 1, "act 0 (SiLU) or 1 (SwiGLU-OAI)");
++    TORCH_CHECK(size_n % FAT_TILE_N == 0 && a.size(1) % (FAT_TILE_K * FAT_G_KSUB) == 0, "size_n % 128, size_k % 32");
++    if (packed_ptrs.numel() == 0 || max_rows <= 0) return;
++    const FatActArgs args{reinterpret_cast<const float*>(gate.data_ptr()), reinterpret_cast<half*>(down_in.data_ptr()),
++                          reinterpret_cast<const int64_t*>(down_scale_ptrs.data_ptr()), static_cast<float>(limit),
++                          static_cast<float>(alpha), static_cast<int>(act)};
++    if (mcg) launch_grouped_cb<1, false, true>(K, a, packed_ptrs, gate, svh_ptrs, row_bounds, at::Tensor(), at::Tensor(), size_n, max_rows, args);
++    else if (mul1) launch_grouped_cb<2, false, true>(K, a, packed_ptrs, gate, svh_ptrs, row_bounds, at::Tensor(), at::Tensor(), size_n, max_rows, args);
++    else launch_grouped_cb<0, false, true>(K, a, packed_ptrs, gate, svh_ptrs, row_bounds, at::Tensor(), at::Tensor(), size_n, max_rows, args);
++}
++
+ // gather: empty, or int64 [output rows] of input rows (fused index_select).
+ void exl3_had_r_128_grouped(at::Tensor input, at::Tensor output, at::Tensor row_group, at::Tensor scale_ptrs,
+                             at::Tensor gather)
+@@ -777,6 +936,50 @@ void exl3_had_r_128_grouped(at::Tensor input, at::Tensor output, at::Tensor row_
+     cuda_check(cudaPeekAtLastError());
+ }
+ 
++// Gate (and up) input transform of the fat tier, one pass over the tokens. x: [tokens, cols] bf16
++// or fp16; token_rows: int32 [tokens, topk], the output row of each route (-1: none). Writes
++// gate_out[r] (and up_out[r] unless up_out is empty) and, if zero_out is non-empty, zeroes
++// zero_out [tokens, cols] fp32.
++void exl3_had_r_128_token_gate_up(at::Tensor x, at::Tensor token_rows, at::Tensor row_group,
++                                  at::Tensor gate_scale_ptrs, at::Tensor up_scale_ptrs,
++                                  at::Tensor gate_out, at::Tensor up_out, at::Tensor zero_out)
++{
++    const bool bf16 = x.scalar_type() == at::kBFloat16;
++    TORCH_CHECK((bf16 || x.scalar_type() == at::kHalf) && x.is_contiguous() && x.dim() == 2 && x.size(1) % 128 == 0,
++                "x must be contiguous bf16/fp16 [tokens, 128*n]");
++    const int64_t tokens = x.size(0), cols = x.size(1);
++    TORCH_CHECK(token_rows.scalar_type() == at::kInt && token_rows.is_contiguous() && token_rows.dim() == 2 &&
++                token_rows.size(0) == tokens, "token_rows int32 [tokens, topk]");
++    TORCH_CHECK(gate_out.scalar_type() == at::kHalf && gate_out.is_contiguous() && gate_out.dim() == 2 &&
++                gate_out.size(1) == cols, "gate_out contiguous float16 [rows, cols]");
++    const bool up = up_out.numel() > 0;
++    TORCH_CHECK(!up || (up_out.scalar_type() == at::kHalf && up_out.is_contiguous() && up_out.sizes() == gate_out.sizes() &&
++                        up_scale_ptrs.scalar_type() == at::kLong), "up_out like gate_out, int64 up_scale_ptrs");
++    TORCH_CHECK(row_group.scalar_type() == at::kInt && row_group.numel() == gate_out.size(0), "row_group int32 [rows]");
++    TORCH_CHECK(gate_scale_ptrs.scalar_type() == at::kLong, "gate_scale_ptrs int64");
++    const bool zero = zero_out.numel() > 0;
++    TORCH_CHECK(!zero || (zero_out.scalar_type() == at::kFloat && zero_out.is_contiguous() &&
++                          zero_out.size(0) == tokens && zero_out.size(1) == cols), "zero_out float32 [tokens, cols]");
++    if (tokens == 0) return;
++    const at::cuda::OptionalCUDAGuard device_guard(x.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++    dim3 grid(static_cast<int>(tokens), static_cast<int>((cols / 128 + 3) / 4));
++    auto launch = [&](auto kernel, const auto* xp) {
++        kernel<<<grid, 128, 0, stream>>>(
++            xp, reinterpret_cast<const int*>(token_rows.data_ptr()), static_cast<int>(token_rows.size(1)),
++            reinterpret_cast<const int*>(row_group.data_ptr()),
++            reinterpret_cast<const int64_t*>(gate_scale_ptrs.data_ptr()),
++            up ? reinterpret_cast<const int64_t*>(up_scale_ptrs.data_ptr()) : nullptr,
++            reinterpret_cast<half*>(gate_out.data_ptr()), up ? reinterpret_cast<half*>(up_out.data_ptr()) : nullptr,
++            zero ? reinterpret_cast<float*>(zero_out.data_ptr()) : nullptr, static_cast<int>(cols), 0.088388347648f);
++    };
++    if (bf16)
++        launch(had_r_128_token_gate_up_kernel<__nv_bfloat16>, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()));
++    else
++        launch(had_r_128_token_gate_up_kernel<half>, reinterpret_cast<const half*>(x.data_ptr()));
++    cuda_check(cudaPeekAtLastError());
++}
++
+ void exl3_act_had_r_128_grouped(at::Tensor gate, at::Tensor up, at::Tensor output, at::Tensor row_group,
+                                 at::Tensor scale_ptrs, double limit, double alpha, int64_t act)
+ {
+diff --git a/csrc/exl3_fat_gemm.cuh b/csrc/exl3_fat_gemm.cuh
+index 725f54f..d35adea 100644
+--- a/csrc/exl3_fat_gemm.cuh
++++ b/csrc/exl3_fat_gemm.cuh
+@@ -36,8 +36,17 @@ void exl3_fat_gemm_grouped(
+     at::Tensor token_idx, at::Tensor route_weight, int64_t K, bool mcg, bool mul1, bool scatter,
+     int64_t size_n, int64_t max_rows);
+ 
++void exl3_fat_gemm_grouped_act(
++    at::Tensor a, at::Tensor packed_ptrs, at::Tensor gate, at::Tensor svh_ptrs, at::Tensor row_bounds,
++    int64_t K, bool mcg, bool mul1, int64_t size_n, int64_t max_rows,
++    at::Tensor down_in, at::Tensor down_scale_ptrs, double limit, double alpha, int64_t act);
++
+ void exl3_had_r_128_grouped(at::Tensor input, at::Tensor output, at::Tensor row_group, at::Tensor scale_ptrs,
+                             at::Tensor gather);
+ 
++void exl3_had_r_128_token_gate_up(at::Tensor x, at::Tensor token_rows, at::Tensor row_group,
++                                  at::Tensor gate_scale_ptrs, at::Tensor up_scale_ptrs,
++                                  at::Tensor gate_out, at::Tensor up_out, at::Tensor zero_out);
++
+ void exl3_act_had_r_128_grouped(at::Tensor gate, at::Tensor up, at::Tensor output, at::Tensor row_group,
+                                 at::Tensor scale_ptrs, double limit, double alpha, int64_t act);
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index 1e0913b..64e6304 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -3201,7 +3201,11 @@ def _fat_kernel_available() -> bool:
+ 
+ def _fat_grouped_available() -> bool:
+     native_c = _load_native_exl3_ext()
+-    return bool(native_c and hasattr(native_c, "exl3_fat_gemm_grouped") and hasattr(native_c, "exl3_act_had_r_128_grouped"))
++    return bool(
++        native_c
++        and hasattr(native_c, "exl3_fat_gemm_grouped_act")
++        and hasattr(native_c, "exl3_had_r_128_token_gate_up")
++    )
+ 
+ 
+ def _fat_grouped_tables(layer: Any, inners: list[dict[str, Any]]) -> dict[str, Any] | None:
+@@ -3246,7 +3250,8 @@ def _fat_grouped_tables(layer: Any, inners: list[dict[str, Any]]) -> dict[str, A
+ 
+ 
+ def apply_exl3_grouped_fat(
+-    xh: torch.Tensor,
++    x: torch.Tensor,
++    route_order: torch.Tensor,
+     token_sorted: torch.Tensor,
+     weight_sorted: torch.Tensor,
+     counts_host: list[int],
+@@ -3255,18 +3260,22 @@ def apply_exl3_grouped_fat(
+     cap: int,
+     out: torch.Tensor,
+     moe_act: int,
++    zero_out: bool = False,
+ ) -> torch.Tensor:
+     """All fat experts of one layer in a handful of launches.
+ 
+-    Rows are already sorted by expert (``token_sorted``/``weight_sorted``). The
+-    fat experts' rows are gathered once; gate/up inputs get their per-expert
+-    input Hadamard in one grouped launch each; gate, up and down run as one
+-    fused dequant+MMA launch per (K, codebook) class; the activation runs once
+-    over all rows; down scatters (atomically) into ``out``. Same math as
+-    apply_exl3_batched_fat, without ~13 small launches per expert.
++    Routes are sorted by expert: sorted position i is flat route ``route_order[i]`` (token
++    route_order[i] // topk) with ``token_sorted``/``weight_sorted``. The fat experts' rows
++    get their gate and up inputs in one pass over the tokens (x read once, bf16 or fp16,
++    each route row written pre-scaled and Hadamard-transformed per expert); gate, up and
++    down run as one fused dequant+MMA launch per (K, codebook) class, the up launches
++    finishing the activation and down-input Hadamard in their epilogue; down scatters
++    (atomically) into ``out``. With ``zero_out`` the token pass also zeroes ``out`` (it
++    must then hold no other contribution). Same math as apply_exl3_batched_fat on
++    x.half(), without ~13 small launches per expert.
+     """
+     native_c = _load_native_exl3_ext()
+-    dev = xh.device
++    dev = x.device
+     fat, spans, offset = [], [], 0
+     for e, n in enumerate(counts_host):
+         if n > cap:
+@@ -3274,16 +3283,29 @@ def apply_exl3_grouped_fat(
+             spans.append((offset, n))
+         offset += n
+     if not fat:
++        if zero_out:
++            out.zero_()
+         return out
+     global _FAT_LOGGED
+     if not _FAT_LOGGED:
+         _FAT_LOGGED = True
+         logger.info("EXL3 fat expert path ACTIVE (grouped; first layer: %d fat experts, cap=%d)" % (len(fat), cap))
++    if moe_act == MOE_ACT_SWIGLU_OAI:
++        act_kind = 1
++    elif moe_act == MOE_ACT_SILU:
++        act_kind = 0
++    else:
++        raise ValueError(f"EXL3 grouped fat path has no implementation for activation {moe_act}")
+     counts = [n for _, n in spans]
+     pos = torch.cat([torch.arange(s, s + n, dtype=torch.long) for s, n in spans]).to(dev, non_blocking=True)
+     tok = token_sorted.index_select(0, pos).contiguous()
+     wts = weight_sorted.index_select(0, pos).to(torch.float16).contiguous()
+     rows = int(pos.numel())
++    tokens = int(x.shape[0])
++    topk = int(route_order.numel()) // tokens
++    # Output row of every fat route, by (token, slot); -1 for routes not on the fat tier.
++    token_rows = torch.full((tokens * topk,), -1, dtype=torch.int32, device=dev)
++    token_rows.index_copy_(0, route_order.index_select(0, pos), torch.arange(rows, dtype=torch.int32, device=dev))
+     fat_t = torch.tensor(fat, dtype=torch.long).to(dev, non_blocking=True)
+     row_group = torch.repeat_interleave(
+         torch.arange(len(fat), dtype=torch.int32), torch.tensor(counts, dtype=torch.long)
+@@ -3292,7 +3314,7 @@ def apply_exl3_grouped_fat(
+     for n in counts:
+         starts.append(starts[-1] + n)
+ 
+-    def run(proj: str, a: torch.Tensor, dst: torch.Tensor, scatter: bool) -> None:
++    def launches(proj: str):
+         t = tables[proj]
+         classes: dict[tuple[int, bool, bool], list[int]] = {}
+         for gi, e in enumerate(fat):
+@@ -3302,39 +3324,39 @@ def apply_exl3_grouped_fat(
+             bounds = torch.tensor(
+                 [b for g in members for b in (starts[g], starts[g + 1])], dtype=torch.int32
+             ).to(dev, non_blocking=True)
+-            native_c.exl3_fat_gemm_grouped(
+-                a, t["trellis"].index_select(0, sel), dst, t["svh"].index_select(0, sel), bounds,
+-                tok if scatter else torch.empty(0, dtype=torch.long, device=dev),
+-                wts if scatter else torch.empty(0, dtype=torch.float16, device=dev),
+-                k, mcg, mul1, scatter, t["out"], max(counts[g] for g in members),
+-            )
++            yield t, sel, bounds, k, mcg, mul1, max(counts[g] for g in members)
+ 
+-    if moe_act == MOE_ACT_SWIGLU_OAI:
+-        act_kind = 1
+-    elif moe_act == MOE_ACT_SILU:
+-        act_kind = 0
+-    else:
+-        raise ValueError(f"EXL3 grouped fat path has no implementation for activation {moe_act}")
+-    # Gather + input Hadamard in one pass per distinct suh.
+-    gate_in = torch.empty(rows, xh.shape[1], dtype=torch.float16, device=dev)
+-    native_c.exl3_had_r_128_grouped(xh, gate_in, row_group, tables["gate"]["suh"].index_select(0, fat_t), tok)
+-    if tables["shared_suh"]:
+-        up_in = gate_in
+-    else:
+-        up_in = torch.empty_like(gate_in)
+-        native_c.exl3_had_r_128_grouped(xh, up_in, row_group, tables["up"]["suh"].index_select(0, fat_t), tok)
+     inter = tables["gate"]["out"]
++    gate_in = torch.empty(rows, x.shape[1], dtype=torch.float16, device=dev)
++    up_in = gate_in if tables["shared_suh"] else torch.empty_like(gate_in)
++    native_c.exl3_had_r_128_token_gate_up(
++        x.contiguous(), token_rows.view(tokens, topk), row_group,
++        tables["gate"]["suh"].index_select(0, fat_t),
++        torch.empty(0, dtype=torch.long, device=dev) if up_in is gate_in else tables["up"]["suh"].index_select(0, fat_t),
++        gate_in, torch.empty(0, dtype=torch.float16, device=dev) if up_in is gate_in else up_in,
++        out if zero_out else torch.empty(0, dtype=torch.float32, device=dev),
++    )
+     gate_out = torch.empty(rows, inter, dtype=torch.float32, device=dev)
+-    up_out = torch.empty(rows, inter, dtype=torch.float32, device=dev)
+-    run("gate", gate_in, gate_out, False)
+-    run("up", up_in, up_out, False)
+-    # Clamp + activation + fp16 round + down-input Hadamard in one pass.
++    for t, sel, bounds, k, mcg, mul1, mr in launches("gate"):
++        native_c.exl3_fat_gemm_grouped(
++            gate_in, t["trellis"].index_select(0, sel), gate_out, t["svh"].index_select(0, sel), bounds,
++            torch.empty(0, dtype=torch.long, device=dev), torch.empty(0, dtype=torch.float16, device=dev),
++            k, mcg, mul1, False, t["out"], mr,
++        )
++    # Up projection; its epilogue applies clamp + activation + fp16 round + down-input Hadamard.
+     down_in = torch.empty(rows, inter, dtype=torch.float16, device=dev)
+-    native_c.exl3_act_had_r_128_grouped(
+-        gate_out, up_out, down_in, row_group, tables["down"]["suh"].index_select(0, fat_t),
+-        float(limit) if limit is not None and limit > 0 else 0.0, MINIMAX_SWIGLU_ALPHA_DEFAULT, act_kind,
+-    )
+-    run("down", down_in, out, True)
++    act_limit = float(limit) if limit is not None and limit > 0 else 0.0
++    for t, sel, bounds, k, mcg, mul1, mr in launches("up"):
++        native_c.exl3_fat_gemm_grouped_act(
++            up_in, t["trellis"].index_select(0, sel), gate_out, t["svh"].index_select(0, sel), bounds,
++            k, mcg, mul1, t["out"], mr, down_in, tables["down"]["suh"].index_select(0, sel),
++            act_limit, MINIMAX_SWIGLU_ALPHA_DEFAULT, act_kind,
++        )
++    for t, sel, bounds, k, mcg, mul1, mr in launches("down"):
++        native_c.exl3_fat_gemm_grouped(
++            down_in, t["trellis"].index_select(0, sel), out, t["svh"].index_select(0, sel), bounds,
++            tok, wts, k, mcg, mul1, True, t["out"], mr,
++        )
+     return out
+ 
+ def _fat_grouped_ok(layer: Any, inners: list[dict[str, Any]]) -> bool:
+@@ -3620,7 +3642,15 @@ def apply_exl3_fused_moe(
+ 
+     local = map_topk_to_local(ids, n_exp, expert_map)
+     topk = int(ids.shape[-1])
+-    xh = x2d.contiguous().half()
++    # fp16 copy of the hidden states, made on first use: the fat-only prefill below reads
++    # x2d itself and never needs it.
++    _xh: list[torch.Tensor] = []
++
++    def half_x() -> torch.Tensor:
++        if not _xh:
++            _xh.append(x2d.contiguous().half())
++        return _xh[0]
++
+ 
+     # exl3_moe_coop fast path (exllamav3 >= 1.5.0): decode-shaped batches only —
+     # slot scratch is capped at 256 (tokens <= 32 at topk 8). Uniform-expert layers
+@@ -3665,7 +3695,7 @@ def apply_exl3_fused_moe(
+             if moe_act is None:
+                 moe_act = resolve_moe_act(layer)
+             exllamav3_ext.exl3_moe_coop(
+-                xh, sel_c, rw_c, 0, int(n_exp), hidden,
++                half_x(), sel_c, rw_c, 0, int(n_exp), hidden,
+                 ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+                 ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+                 ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+@@ -3708,7 +3738,7 @@ def apply_exl3_fused_moe(
+                 moe_act = resolve_moe_act(layer)
+             out = torch.empty(tokens, hidden, dtype=torch.float32, device=dev)
+             exllamav3_ext.exl3_moe_coop_mk(
+-                xh, sel_p, rw_c, 0, int(n_exp), hidden,
++                half_x(), sel_p, rw_c, 0, int(n_exp), hidden,
+                 *mk_ptrs,
+                 None, None, None,
+                 *mk_karr, int(k_lo), int(k_hi),
+@@ -3753,7 +3783,7 @@ def apply_exl3_fused_moe(
+                 # Every row is written: rows with no slot in [lo, hi) get prev (or zeros).
+                 cur = torch.empty(tokens, hidden, dtype=torch.float32, device=dev)
+                 exllamav3_ext.exl3_moe_coop(
+-                    xh, sel_p, rw_c, int(lo), int(hi), hidden,
++                    half_x(), sel_p, rw_c, int(lo), int(hi), hidden,
+                     *gptrs,
+                     None, None, None,
+                     int(kg), int(ku), int(kd), mcg, mul1, moe_act, act_limit,
+@@ -3772,13 +3802,12 @@ def apply_exl3_fused_moe(
+     expert_count.scatter_add_(
+         0, local.long(), torch.ones(local.shape, dtype=torch.long, device=local.device)
+     )
+-    out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
+-
+     counts = expert_count[:n_exp]
+ 
+     _capturing = bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+     if (not _capturing) and tokens > TEMP_ROWS_FUSED and bool((counts > TEMP_ROWS_FUSED).any().item()):
+         logger.info_once("EXL3 fat-chunk slicing ACTIVE (tokens=%d)" % tokens)
++        out = torch.empty(tokens, hidden, dtype=torch.float32, device=x2d.device)
+         for s in range(0, tokens, TEMP_ROWS_FUSED):
+             e = min(s + TEMP_ROWS_FUSED, tokens)
+             out[s:e] = apply_exl3_fused_moe(
+@@ -3786,14 +3815,31 @@ def apply_exl3_fused_moe(
+             )
+         return out
+ 
++    moe_act = getattr(layer, "_exl3_moe_act", None)
++    if moe_act is None:
++        moe_act = resolve_moe_act(layer)
+     fat_thr = FAT_THRESHOLD_PREFILL if tokens >= FAT_PREFILL_TOKENS else FAT_EXPERT_THRESHOLD
+     fat_possible = (not _capturing) and (tokens > fat_thr)
+     fat_route = torch.zeros_like(local, dtype=torch.bool)
+-    if fat_possible:
++    # Per-expert row counts on the host, read once: the fat decision needs a sync anyway, and
++    # the fat tier reuses them.
++    counts_host = counts.tolist() if fat_possible else None
++    fat_active = counts_host is not None and any(c > fat_thr for c in counts_host)
++    if fat_active and all(c == 0 or c > fat_thr for c in counts_host) and _fat_grouped_ok(layer, inners):
++        # Every routed expert is fat (e.g. VLLM_EXL3_FAT_THRESHOLD_PREFILL=0): no standard launch,
++        # no fp16 copy of x and no separate zero fill; the fat tier's token pass zeroes out.
++        fat_order = local.argsort()
++        out = torch.empty(tokens, hidden, dtype=torch.float32, device=x2d.device)
++        layer._exl3_last_apply = "fat"
++        return apply_exl3_grouped_fat(
++            x2d, fat_order, flat_token[fat_order], flat_weight[fat_order], counts_host,
++            _fat_grouped_tables(layer, inners), limit, fat_thr, out, moe_act, zero_out=True,
++        )
++    out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
++    if fat_active:
+         fat = counts > fat_thr
+-        if bool(fat.any().item()):
+-            safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
+-            fat_route = (local < n_exp) & fat.index_select(0, safe_local)
++        safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
++        fat_route = (local < n_exp) & fat.index_select(0, safe_local)
+ 
+     # The standard kernel handles non-fat routes. Fat routes are represented by
+     # the invalid sentinel with zero weight here and are dispatched exactly once
+@@ -3827,9 +3873,6 @@ def apply_exl3_fused_moe(
+     fn = exllamav3_ext.exl3_moe
+     # -1 = unknown active count: max-concurrency grid, no .item() host sync.
+     n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
+-    moe_act = getattr(layer, "_exl3_moe_act", None)
+-    if moe_act is None:
+-        moe_act = resolve_moe_act(layer)
+ 
+     k_tuple_single = getattr(layer, "_exl3_k_tuple", None)
+     if is_mixedk and k_tuple_single is None and hasattr(exllamav3_ext, "exl3_moe_mixedk"):
+@@ -3927,7 +3970,7 @@ def apply_exl3_fused_moe(
+                         ),
+                     )
+                 args_grp = (
+-                    xh,
++                    half_x(),
+                     out,
+                     grp_count,
+                     grp_token_sorted,
+@@ -3963,7 +4006,7 @@ def apply_exl3_fused_moe(
+                     fn(*args_grp, n_active_host, *_tail)
+                 else:
+                     fn(*args_grp)
+-            if fat_possible and bool(fat.any().item()):
++            if fat_active:
+                 fat_order = local.argsort()
+                 # The fat GEMM tier is a distinct inner path: append it to the
+                 # base label so the receipt shows both families that ran.
+@@ -3971,10 +4014,10 @@ def apply_exl3_fused_moe(
+                     (layer._exl3_last_apply or "fused") + "+fat"
+                 )
+                 apply_exl3_batched_fat(
+-                    xh,
++                    half_x(),
+                     flat_token[fat_order],
+                     flat_weight[fat_order],
+-                    counts.tolist(),
++                    counts_host,
+                     inners,
+                     limit,
+                     fat_thr,
+@@ -3989,7 +4032,7 @@ def apply_exl3_fused_moe(
+         layer._exl3_last_apply = "mixedk_unified"
+         fn_mk = exllamav3_ext.exl3_moe_mixedk
+         args_mk = (
+-            xh,
++            half_x(),
+             out,
+             standard_count,
+             token_sorted,
+@@ -4040,7 +4083,7 @@ def apply_exl3_fused_moe(
+             k = int(getattr(layer, "_exl3_k", 4) or 4)
+             kg = ku = kd = k
+         args = (
+-            xh,
++            half_x(),
+             out,
+             standard_count,
+             token_sorted,
+@@ -4074,7 +4117,7 @@ def apply_exl3_fused_moe(
+         else:
+             fn(*args)
+ 
+-    if fat_possible and bool(fat.any().item()):
++    if fat_active:
+         fat_order = local.argsort()
+         # The fat GEMM tier is a distinct inner path: append it to the base
+         # label so the receipt shows both families that ran.
+@@ -4083,10 +4126,11 @@ def apply_exl3_fused_moe(
+         )
+         if _fat_grouped_ok(layer, inners):
+             apply_exl3_grouped_fat(
+-                xh,
++                x2d,
++                fat_order,
+                 flat_token[fat_order],
+                 flat_weight[fat_order],
+-                counts.tolist(),
++                counts_host,
+                 _fat_grouped_tables(layer, inners),
+                 limit,
+                 fat_thr,
+@@ -4095,10 +4139,10 @@ def apply_exl3_fused_moe(
+             )
+         else:
+             apply_exl3_batched_fat(
+-                xh,
++                half_x(),
+                 flat_token[fat_order],
+                 flat_weight[fat_order],
+-                counts.tolist(),
++                counts_host,
+                 inners,
+                 limit,
+                 fat_thr,
+diff --git a/tests/gpu/bench_fat_glue.py b/tests/gpu/bench_fat_glue.py
+new file mode 100644
+index 0000000..23e3c17
+--- /dev/null
++++ b/tests/gpu/bench_fat_glue.py
+@@ -0,0 +1,162 @@
++"""Fat-tier MoE apply per layer on recorded routing: previous glue vs the token-pass glue (run in the image).
++
++ROUTING: glob of per-layer top-k id files (torch.load -> int [tokens, k] over 128 experts), one per
++MoE layer in order. KMAP (optional): JSON {"layer,expert,w1|w2|w3": K} (w1 gate, w3 up, w2 down).
++Every routed expert takes the fat tier (VLLM_EXL3_FAT_THRESHOLD_PREFILL=0). Random weights,
++MiniMax-M3.1 TP2 per-rank shapes (hidden 6144, intermediate 1536, mul1, SwiGLU-OAI, limit 7).
++
++mid:  the token pass, then the previous gate/up/act_had/down (the token pass alone)
++prev: x.half(); zeros; grouped input Hadamard for gate and for up (row gather); gate and up GEMMs
++      into fp32; act_had; down scatter (the 7ac4fbc apply_exl3_grouped_fat with its caller's glue)
++new:  apply_exl3_grouped_fat as shipped: token pass (bf16 x read once, gate+up rows, zeroes out);
++      gate GEMM; up GEMM with the activation epilogue; down scatter
++Prints per-layer-summed ms of both, the glue kernels alone, and the max |diff| of the outputs.
++"""
++import glob
++import json
++import os
++import statistics
++
++import torch
++import vllm_exl3_c as nat
++from vllm_exl3.exl3 import MINIMAX_SWIGLU_ALPHA_DEFAULT, MOE_ACT_SWIGLU_OAI, apply_exl3_grouped_fat
++
++dev = "cuda"
++torch.manual_seed(0)
++H, I, E, LIMIT = 6144, 1536, 128, 7.0
++files = sorted(glob.glob(os.environ["ROUTING"]))
++kmap = json.load(open(os.environ["KMAP"])) if os.environ.get("KMAP") else {}
++kmap_layers = sorted({int(k.split(",")[0]) for k in kmap})
++reps = int(os.environ.get("REPS", "5"))
++el, eh = torch.empty(0, dtype=torch.long, device=dev), torch.empty(0, dtype=torch.float16, device=dev)
++
++
++def tr(k_in, k_out, K):
++    return torch.randint(-32768, 32767, (k_in // 16, k_out // 16, 16 * K), dtype=torch.int16, device=dev)
++
++
++W = {(p, K): [tr(*((I, H) if p == "down" else (H, I)), K) for _ in range(E)] for p in ("gate", "up", "down") for K in (2, 3)}
++SV = {p: [(torch.rand(H if p == "down" else I, device=dev) * 0.02 + 0.01).half() for _ in range(E)] for p in ("gate", "up", "down")}
++SU = {p: [torch.where(torch.rand(I if p == "down" else H, device=dev) < 0.5, -1.0, 1.0).half() for _ in range(E)]
++      for p in ("gate", "up", "down")}
++
++
++def timed(fn):
++    fn()
++    ev = [torch.cuda.Event(enable_timing=True) for _ in range(2 * reps)]
++    for r in range(reps):
++        ev[2 * r].record()
++        fn()
++        ev[2 * r + 1].record()
++    torch.cuda.synchronize()
++    return statistics.median(ev[2 * r].elapsed_time(ev[2 * r + 1]) for r in range(reps))
++
++
++tot = {"prev": 0.0, "new": 0.0, "prev glue": 0.0, "new glue": 0.0}
++maxdiff = 0.0
++for li, f in enumerate(files):
++    ids = torch.load(f).long().to(dev)
++    T, topk = ids.shape
++    x = (torch.randn(T, H, device=dev) * 0.5).to(torch.bfloat16)
++    flat = ids.reshape(-1)
++    counts = torch.bincount(flat, minlength=E)[:E].tolist()
++    Kof = {(e, p): (kmap.get(f"{kmap_layers[li]},{e},{w}", 2) if kmap_layers else 2)
++           for e in range(E) for p, w in (("gate", "w1"), ("up", "w3"), ("down", "w2"))}
++    tables = {"shared_suh": False}
++    for p in ("gate", "up", "down"):
++        tables[p] = {
++            "trellis": torch.tensor([W[(p, Kof[(e, p)])][e].data_ptr() for e in range(E)], dtype=torch.int64, device=dev),
++            "svh": torch.tensor([SV[p][e].data_ptr() for e in range(E)], dtype=torch.int64, device=dev),
++            "suh": torch.tensor([SU[p][e].data_ptr() for e in range(E)], dtype=torch.int64, device=dev),
++            "class": [(Kof[(e, p)], False, True) for e in range(E)],
++            "out": H if p == "down" else I,
++        }
++    order = flat.argsort()
++    flat_token = torch.arange(T, device=dev).repeat_interleave(topk)
++    flat_w = (torch.rand(T * topk, device=dev) * 0.5).half()
++    ts, ws = flat_token[order], flat_w[order]
++
++    def new():
++        out = torch.empty(T, H, dtype=torch.float32, device=dev)
++        return apply_exl3_grouped_fat(x, order, ts, ws, counts, tables, LIMIT, 0, out, MOE_ACT_SWIGLU_OAI, zero_out=True)
++
++    # Previous pipeline, launch by launch.
++    fat = [e for e in range(E) if counts[e] > 0]
++    cnt = [counts[e] for e in fat]
++    rows = sum(cnt)
++    starts = [0]
++    for n in cnt:
++        starts.append(starts[-1] + n)
++    tok = ts.contiguous()
++    fat_t = torch.tensor(fat, dtype=torch.long, device=dev)
++    row_group = torch.repeat_interleave(torch.arange(len(fat), dtype=torch.int32, device=dev), torch.tensor(cnt, device=dev))
++
++    def classes(p):
++        cl = {}
++        for gi, e in enumerate(fat):
++            cl.setdefault(tables[p]["class"][e], []).append(gi)
++        res = []
++        for (k, mcg, mul1), members in cl.items():
++            sel = torch.tensor([fat[g] for g in members], dtype=torch.long, device=dev)
++            b = torch.tensor([v for g in members for v in (starts[g], starts[g + 1])], dtype=torch.int32, device=dev)
++            res.append((tables[p]["trellis"][sel], tables[p]["svh"][sel], b, k, mcg, mul1, max(cnt[g] for g in members)))
++        return res
++
++    cls = {p: classes(p) for p in ("gate", "up", "down")}
++    gs, us, ds = (tables[p]["suh"].index_select(0, fat_t) for p in ("gate", "up", "down"))
++    gate_in = torch.empty(rows, H, dtype=torch.float16, device=dev)
++    up_in = torch.empty_like(gate_in)
++    gate_out = torch.empty(rows, I, dtype=torch.float32, device=dev)
++    up_out = torch.empty_like(gate_out)
++    down_in = torch.empty(rows, I, dtype=torch.float16, device=dev)
++
++    def prev_glue_a():
++        xh = x.half()
++        out = torch.zeros(T, H, dtype=torch.float32, device=dev)
++        nat.exl3_had_r_128_grouped(xh, gate_in, row_group, gs, tok)
++        nat.exl3_had_r_128_grouped(xh, up_in, row_group, us, tok)
++        return out
++
++    def prev_act():
++        nat.exl3_act_had_r_128_grouped(gate_out, up_out, down_in, row_group, ds, LIMIT, MINIMAX_SWIGLU_ALPHA_DEFAULT, 1)
++
++    def prev():
++        out = prev_glue_a()
++        for p, a, dst in (("gate", gate_in, gate_out), ("up", up_in, up_out)):
++            for t, s, b, k, mcg, mul1, mr in cls[p]:
++                nat.exl3_fat_gemm_grouped(a, t, dst, s, b, el, eh, k, mcg, mul1, False, I, mr)
++        prev_act()
++        for t, s, b, k, mcg, mul1, mr in cls["down"]:
++            nat.exl3_fat_gemm_grouped(down_in, t, out, s, b, tok, ws, k, mcg, mul1, True, H, mr)
++        return out
++
++    def new_glue():
++        token_rows = torch.full((T * topk,), -1, dtype=torch.int32, device=dev)
++        token_rows.index_copy_(0, order, torch.arange(rows, dtype=torch.int32, device=dev))
++        out = torch.empty(T, H, dtype=torch.float32, device=dev)
++        nat.exl3_had_r_128_token_gate_up(x, token_rows.view(T, topk), row_group, gs, us, gate_in, up_in, out)
++
++    def mid():
++        # Token pass, then the previous gate/up/act_had/down: separates the two changes.
++        token_rows = torch.full((T * topk,), -1, dtype=torch.int32, device=dev)
++        token_rows.index_copy_(0, order, torch.arange(rows, dtype=torch.int32, device=dev))
++        out = torch.empty(T, H, dtype=torch.float32, device=dev)
++        nat.exl3_had_r_128_token_gate_up(x, token_rows.view(T, topk), row_group, gs, us, gate_in, up_in, out)
++        for p, a, dst in (("gate", gate_in, gate_out), ("up", up_in, up_out)):
++            for t, s, b, k, mcg, mul1, mr in cls[p]:
++                nat.exl3_fat_gemm_grouped(a, t, dst, s, b, el, eh, k, mcg, mul1, False, I, mr)
++        prev_act()
++        for t, s, b, k, mcg, mul1, mr in cls["down"]:
++            nat.exl3_fat_gemm_grouped(down_in, t, out, s, b, tok, ws, k, mcg, mul1, True, H, mr)
++        return out
++
++    d = (new() - prev()).abs().max().item()
++    tot["mid"] = tot.get("mid", 0.0) + timed(mid)
++    maxdiff = max(maxdiff, d)
++    tot["prev"] += timed(prev)
++    tot["new"] += timed(new)
++    tot["prev glue"] += timed(prev_glue_a) + timed(prev_act)
++    tot["new glue"] += timed(new_glue)
++print(f"{len(files)} layers: prev {tot['prev']:.1f} ms, token pass only {tot['mid']:.1f} ms, new {tot['new']:.1f} ms "
++      f"(glue only: prev x.half+zeros+2 had+act_had {tot['prev glue']:.1f} ms, new token pass {tot['new glue']:.1f} ms); "
++      f"max |out diff| {maxdiff:.2e}")
+diff --git a/tests/gpu/test_fat_gemm_grouped.py b/tests/gpu/test_fat_gemm_grouped.py
+index 0e3a5bb..9bccba2 100644
+--- a/tests/gpu/test_fat_gemm_grouped.py
++++ b/tests/gpu/test_fat_gemm_grouped.py
+@@ -167,6 +167,66 @@ for act, limit in ((1, 7.0), (1, 0.0), (0, 7.0)):
+     fails += not ok
+     print(f"fused act={act} limit={limit}: rel {r_act:.1e} {'OK' if ok else 'FAIL'}")
+ 
++# Token-pass gate/up input transform (bf16 or fp16 x, routes as (token, slot) -> row) vs the grouped
++# Hadamard on x.half() gathered by token: must be bit-identical; zero_out must be zeroed.
++tokens_t, topk_t, cols_t, groups_t = 300, 4, 1024, 7
++route_e = torch.randint(0, groups_t, (tokens_t * topk_t,), device=dev)
++order_t = route_e.argsort(stable=True)
++fat_mask = torch.rand(tokens_t * topk_t, device=dev) < 0.9  # some routes are not on the fat tier
++sorted_routes = order_t[fat_mask[order_t]]
++rows_t = int(sorted_routes.numel())
++tok_t = (sorted_routes // topk_t).long()
++rg_t = route_e[sorted_routes].to(torch.int32)
++token_rows = torch.full((tokens_t * topk_t,), -1, dtype=torch.int32, device=dev)
++token_rows[sorted_routes] = torch.arange(rows_t, dtype=torch.int32, device=dev)
++g_sc = [(torch.rand(cols_t, device=dev) + 0.5).half() for _ in range(groups_t)]
++u_sc = [(torch.rand(cols_t, device=dev) + 0.5).half() for _ in range(groups_t)]
++for dtype in (torch.bfloat16, torch.float16):
++    xt = (torch.randn(tokens_t, cols_t, device=dev) * 3).to(dtype)
++    ref_g = torch.empty(rows_t, cols_t, dtype=torch.float16, device=dev)
++    ref_u = torch.empty_like(ref_g)
++    nat.exl3_had_r_128_grouped(xt.half(), ref_g, rg_t, ptrs(g_sc), tok_t)
++    nat.exl3_had_r_128_grouped(xt.half(), ref_u, rg_t, ptrs(u_sc), tok_t)
++    yg, yu = torch.empty_like(ref_g), torch.empty_like(ref_u)
++    zo = torch.full((tokens_t, cols_t), 7.0, device=dev)
++    nat.exl3_had_r_128_token_gate_up(xt, token_rows.view(tokens_t, topk_t), rg_t, ptrs(g_sc), ptrs(u_sc), yg, yu, zo)
++    ys = torch.empty_like(ref_g)
++    nat.exl3_had_r_128_token_gate_up(xt, token_rows.view(tokens_t, topk_t), rg_t, ptrs(g_sc), empty_l, ys,
++                                     empty_h, torch.empty(0, device=dev))
++    ok = torch.equal(yg, ref_g) and torch.equal(yu, ref_u) and torch.equal(ys, ref_g) and bool((zo == 0).all())
++    fails += not ok
++    print(f"token gate/up had {dtype}: bit-identical {torch.equal(yg, ref_g) and torch.equal(yu, ref_u)}, "
++          f"zeroed {bool((zo == 0).all())} {'OK' if ok else 'FAIL'}")
++
++# Up projection with the activation epilogue vs grouped up into fp32 + exl3_act_had_r_128_grouped: bit-identical.
++for k, mcg, mul1 in ((2, False, True), (3, False, True), (4, True, False)):
++    counts = [300, 1, 0, 129, 64, 257]
++    size_in, inter = 1024, 768
++    rows = sum(counts)
++    starts = [0]
++    for n in counts:
++        starts.append(starts[-1] + n)
++    bounds = torch.tensor([b for g in range(len(counts)) for b in (starts[g], starts[g + 1])], dtype=torch.int32,
++                          device=dev)
++    rg = torch.repeat_interleave(torch.arange(len(counts), dtype=torch.int32, device=dev),
++                                 torch.tensor(counts, device=dev))
++    a = (torch.randn(rows, size_in, device=dev) * 0.5).half()
++    tr, svh = experts(len(counts), size_in, inter, k)
++    dsuh = [(torch.rand(inter, device=dev) + 0.5).half() for _ in counts]
++    gate_f = torch.randn(rows, inter, device=dev) * 4
++    for act, limit in ((1, 7.0), (0, 0.0)):
++        up_f = torch.empty(rows, inter, dtype=torch.float32, device=dev)
++        nat.exl3_fat_gemm_grouped(a, ptrs(tr), up_f, ptrs(svh), bounds, empty_l, empty_h, k, mcg, mul1, False,
++                                  inter, max(counts))
++        ref = torch.empty(rows, inter, dtype=torch.float16, device=dev)
++        nat.exl3_act_had_r_128_grouped(gate_f, up_f, ref, rg, ptrs(dsuh), limit, 1.702, act)
++        y = torch.empty_like(ref)
++        nat.exl3_fat_gemm_grouped_act(a, ptrs(tr), gate_f, ptrs(svh), bounds, k, mcg, mul1, inter, max(counts),
++                                      y, ptrs(dsuh), limit, 1.702, act)
++        ok = torch.equal(y, ref)
++        fails += not ok
++        print(f"grouped up + act epilogue K={k} act={act} limit={limit}: bit-identical {ok} {'OK' if ok else 'FAIL'}")
++
+ # Timing on the 2.15 lane's per-rank gate shape: 128 experts, ~256 rows each (8K tokens, top-4), K3.
+ k, n_exp, size_in, size_out = 3, 128, 6144, 1536
+ counts = torch.multinomial(torch.ones(n_exp), 8192 * 4, replacement=True).bincount(minlength=n_exp).tolist()
+-- 
+2.51.0
+
