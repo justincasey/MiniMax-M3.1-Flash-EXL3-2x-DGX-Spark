@@ -1,3 +1,5 @@
+![MiniMax M3.1 Flash on 2× DGX Spark: 1,561 tok/s prefill, 66.4 tok/s decode at 4 streams, 30.8 tok/s single stream](docs/images/hero.png)
+
 # MiniMax-M3.1-Flash EXL3 2.15 bpw at TP=2 on two DGX Sparks
 
 A serving recipe for [MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash). It serves
