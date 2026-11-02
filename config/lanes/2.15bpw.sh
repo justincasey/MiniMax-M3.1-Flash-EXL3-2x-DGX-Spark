@@ -17,7 +17,7 @@ LANE_MANIFEST_FILE="config/lanes/2.15bpw/pack-manifest.tsv"
 CENSUS_FILE="${CENSUS_FILE:-config/lanes/2.15bpw/pack-census.json}"
 
 # An alternative to the DSpark draft that ships inside the pack: DFlash2 (incoai,
-# apache-2.0), a 5-layer block-diffusion drafter (4.25 GiB, bf16) for MiniMax-M3.1-Flash.
+# apache-2.0), a 5-layer block-diffusion drafter (3.96 GiB, bf16) for MiniMax-M3.1-Flash.
 # The pinned vLLM already carries the path: architectures=["DFlash2DraftModel"] resolves
 # to qwen3_dflash2.DFlash2Qwen3ForCausalLM and DFlash2Speculator, and the model runner
 # reads dflash_config.target_layer_ids from the draft config to choose which target
