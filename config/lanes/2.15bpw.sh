@@ -15,4 +15,19 @@ MODEL_BYTES="${MODEL_BYTES:-118985525140}"
 OVERLAY_FILE="${OVERLAY_FILE-}"
 LANE_MANIFEST_FILE="config/lanes/2.15bpw/pack-manifest.tsv"
 CENSUS_FILE="${CENSUS_FILE:-config/lanes/2.15bpw/pack-census.json}"
+
+# An alternative to the DSpark draft that ships inside the pack: DFlash2 (incoai,
+# apache-2.0), a 5-layer block-diffusion drafter (4.25 GiB, bf16) for MiniMax-M3.1-Flash.
+# The pinned vLLM already carries the path: architectures=["DFlash2DraftModel"] resolves
+# to qwen3_dflash2.DFlash2Qwen3ForCausalLM and DFlash2Speculator, and the model runner
+# reads dflash_config.target_layer_ids from the draft config to choose which target
+# layers need hidden-state capture, so the image needs no change. Selected with
+# SPEC_METHOD=dflash. Pinned like the pack: the full revision sha, sha256 and size per
+# file (the draft is a separate model under its own license from the pack's).
+DRAFT_REPO="${DRAFT_REPO:-incoai/MiniMax-M3.1-Flash-DFlash2}"
+DRAFT_REV="${DRAFT_REV:-ac07a7c1ecaae26a7ace595756124dca974b432d}"
+DRAFT_NAME="${DRAFT_NAME:-MiniMax-M3.1-Flash-DFlash2}"
+DRAFT_BYTES="${DRAFT_BYTES:-4248070981}"
+DRAFT_MANIFEST_FILE="${DRAFT_MANIFEST_FILE:-config/lanes/2.15bpw/dflash2-manifest.tsv}"
+
 LANE_DEFAULT_PROFILE="q4-300k"
