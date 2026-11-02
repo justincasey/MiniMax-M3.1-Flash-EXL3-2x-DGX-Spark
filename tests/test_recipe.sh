@@ -231,6 +231,31 @@ for want in "serve /models/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw" \
   has "$c" "$want" || { bad "2.15 lane: missing $want"; miss=1; }
 done
 (( miss == 0 )) && ok "2.15 lane serves the q4-300k flag set"
+
+# ── the drafter selector ────────────────────────────────────────────────────
+# The default must stay the pack's own DSpark draft (the flag set above covers its
+# speculative-config), so only the dflash branch and the gates are checked here.
+has "$(rank_cmd 0)" '"method":"dspark"' && ok "default drafter is the pack's dspark" || bad "default drafter"
+c=$(SPEC_METHOD=dflash rank_cmd 0)
+has "$c" '"method":"dflash","model":"/models/MiniMax-M3.1-Flash-DFlash2","num_speculative_tokens":3' \
+  && ok "SPEC_METHOD=dflash selects the lane's pinned draft" || bad "SPEC_METHOD=dflash serve line"
+python3 - <<'PY' && ok "DFlash2 draft manifest" || bad "DFlash2 draft manifest"
+rows = [l.rstrip("\n").split("\t") for l in open("config/lanes/2.15bpw/dflash2-manifest.tsv") if l.strip()]
+assert len(rows) == 5, len(rows)
+assert all(len(r) == 3 and len(r[0]) == 64 for r in rows)
+assert sum(int(r[1]) for r in rows) == 4248070981
+assert any(r[2] == "model.safetensors" for r in rows)
+PY
+out=$(SPEC_METHOD=bogus ./m31.sh print-serve 0 2>&1 || true)
+grep -q "SPEC_METHOD=bogus: use dspark, dflash or none" <<<"$out" && ok "unknown SPEC_METHOD refused" || bad "unknown SPEC_METHOD"
+out=$(SPEC_METHOD=dflash DRAFT_BYTES=1 ./m31.sh print-serve 0 2>&1 || true)
+grep -q "draft manifest totals" <<<"$out" && ok "draft manifest must total the pin" || bad "draft manifest total"
+out=$(SPEC_METHOD=dflash DRAFT_REV=ac07a7c ./m31.sh print-serve 0 2>&1 || true)
+grep -q "DRAFT_REV must be a full 40-character" <<<"$out" && ok "draft revision must be a full sha" || bad "draft revision sha"
+out=$(SPEC_METHOD=dflash DRAFT_NAME= ./m31.sh print-serve 0 2>&1 || true)
+grep -q "pins no draft checkpoint" <<<"$out" && ok "dflash refused on a lane that pins no draft" || bad "lane without a draft pin"
+has "$(DSPARK=0 KV_Q4=0 KV_CACHE_DTYPE=fp8 INDEXER_MXFP8=0 rank_cmd 0)" "speculative-config" \
+  && bad "DSPARK=0 still sends speculative-config" || ok "DSPARK=0 keeps spec decode off (legacy spelling)"
 printf 'LANE=2.15bpw\n' > /tmp/m31-lane.env
 c=$(ENV_FILE=/tmp/m31-lane.env rank_cmd 0)
 has "$c" "serve /models/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw" && ok "LANE is read from ENV_FILE" || bad "LANE from ENV_FILE"

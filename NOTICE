@@ -52,6 +52,12 @@ Other credits:
 - MiniMax: MiniMax-M3.1-Flash. The weights, including the EXL3 SAGE pack, are
   not included in this repository; they are under the MiniMax Community
   License (non-commercial use, with conditions for commercial use).
+- incoai / z-lab (https://github.com/z-lab/dflash): MiniMax-M3.1-Flash-DFlash2
+  (https://huggingface.co/incoai/MiniMax-M3.1-Flash-DFlash2), the DFlash 2
+  block-diffusion draft served when SPEC_METHOD=dflash. Apache-2.0 per its model
+  card; a draft model derived from MiniMax-M3.1-Flash. Not included in this
+  repository: fetch downloads it at the revision pinned by the lane and verifies
+  every file against config/lanes/2.15bpw/dflash2-manifest.tsv.
 
 The benchmark prompt sets and harness structure follow the author's earlier
 DGX Spark recipes, both Apache-2.0.

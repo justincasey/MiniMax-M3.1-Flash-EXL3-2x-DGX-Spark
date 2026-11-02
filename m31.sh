@@ -86,7 +86,16 @@ DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-32768}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-1800}"
 WARMUP="${WARMUP:-1}"
 
+# SPEC_METHOD picks the drafter: dspark (the checkpoint that ships inside the pack)
+# | dflash (the lane's pinned external draft) | none. DSPARK=1 stays the legacy
+# spelling of dspark; an explicit SPEC_METHOD wins. SPEC_ON means "spec decode is on",
+# which is what sizes the decode CUDA graphs (rows = streams x (k+1)).
+SPEC_METHOD="${SPEC_METHOD:-}"
 DSPARK="${DSPARK:-1}"
+[[ -n "$SPEC_METHOD" ]] || { [[ "$DSPARK" == 1 ]] && SPEC_METHOD=dspark || SPEC_METHOD=none; }
+case "$SPEC_METHOD" in dspark|dflash|none) ;; *) die "SPEC_METHOD=$SPEC_METHOD: use dspark, dflash or none" ;; esac
+DSPARK=$([[ "$SPEC_METHOD" == dspark ]] && echo 1 || echo 0)
+SPEC_ON=$([[ "$SPEC_METHOD" == none ]] && echo 0 || echo 1)
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
 DRAFT_ATTN_BACKEND="${DRAFT_ATTN_BACKEND:-TRITON_ATTN}"
 DRAFT_KV_DTYPE="${DRAFT_KV_DTYPE:-fp8}"
@@ -151,6 +160,8 @@ MODELS_DIR="${MODELS_DIR:-/home/$SSH_USER/models}"
 CACHE_DIR="${CACHE_DIR:-/home/$SSH_USER/.cache/m31}"
 BUILD_DIR="${BUILD_DIR:-/home/$SSH_USER/build/m31}"
 MODEL_DIR="$MODELS_DIR/$MODEL_NAME"
+# Empty when the lane pins no external draft: DRAFT_DIR must never fall back to $MODELS_DIR.
+DRAFT_DIR="${DRAFT_NAME:+$MODELS_DIR/$DRAFT_NAME}"
 read -r -a PATCH_LIST <<<"$PATCH_FILES"
 read -r -a EXL3_PATCH_LIST <<<"${EXL3_PATCH_FILES:-}"
 # One sha256 over both series (plugin, then exllamav3), in apply order: the image tag and label
@@ -229,6 +240,9 @@ install_tools() {  # once per invocation; both ranks in parallel
       rsync -a -e "ssh ${SSH_OPTS[*]}" "$ROOT/scripts/" "$(target_of "$r"):$TOOLS/"
       if [[ -n "$OVERLAY_FILE" ]]; then rsync_to "$r" "$ROOT/$OVERLAY_FILE" "$BASE_DIR/overlay.json"; fi
       rsync_to "$r" "$ROOT/$MANIFEST_FILE" "$BASE_DIR/pack-manifest.tsv"
+      if [[ -n "${DRAFT_MANIFEST_FILE:-}" && -f "$ROOT/$DRAFT_MANIFEST_FILE" ]]; then
+        rsync_to "$r" "$ROOT/$DRAFT_MANIFEST_FILE" "$BASE_DIR/draft-manifest.tsv"
+      fi
       remote "$r" "chmod +x '$TOOLS'/*.sh '$TOOLS'/*.py 2>/dev/null || true"
     ) & pids+=($!)
   done
@@ -290,7 +304,7 @@ PY
 )
   fi
   if [[ -z "$CAPTURE_SIZES" ]]; then
-    CAPTURE_SIZES=$(python3 - "$MAX_NUM_SEQS" "$NUM_SPECULATIVE_TOKENS" "$DSPARK" <<'PY'
+    CAPTURE_SIZES=$(python3 - "$MAX_NUM_SEQS" "$NUM_SPECULATIVE_TOKENS" "$SPEC_ON" <<'PY'
 import sys
 seqs, k, dspark = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3] == "1"
 rows = seqs * (k + 1) if dspark else seqs
@@ -313,13 +327,24 @@ check_config() {
   if [[ "$KV_Q4" == 1 ]]; then
     [[ "$KV_CACHE_DTYPE" == nvfp4 ]] || die "KV_Q4=1 requires KV_CACHE_DTYPE=nvfp4"
     [[ "$INDEXER_KV_DTYPE" == fp8 ]] || die "KV_Q4=1 requires INDEXER_KV_DTYPE=fp8"
-    [[ "$DSPARK" == 1 && "$DRAFT_KV_DTYPE" == fp8 && "$DRAFT_ATTN_BACKEND" == TRITON_ATTN ]] \
-      || die "KV_Q4=1 requires DSPARK=1, DRAFT_KV_DTYPE=fp8, DRAFT_ATTN_BACKEND=TRITON_ATTN"
+    [[ "$SPEC_ON" == 1 && "$DRAFT_KV_DTYPE" == fp8 && "$DRAFT_ATTN_BACKEND" == TRITON_ATTN ]] \
+      || die "KV_Q4=1 requires spec decode on (dspark or dflash), DRAFT_KV_DTYPE=fp8, DRAFT_ATTN_BACKEND=TRITON_ATTN"
   else
     [[ "$KV_CACHE_DTYPE" != nvfp4 ]] || die "KV_CACHE_DTYPE=nvfp4 without KV_Q4=1 is an upstream raise"
   fi
-  if [[ "$DSPARK" == 1 ]]; then
+  if [[ "$SPEC_ON" == 1 ]]; then
     (( NUM_SPECULATIVE_TOKENS >= 1 )) || die "NUM_SPECULATIVE_TOKENS must be >= 1"
+  fi
+  if [[ "$SPEC_METHOD" == dflash ]]; then
+    [[ -n "${DRAFT_NAME:-}" && -n "${DRAFT_REV:-}" && -n "${DRAFT_BYTES:-}" && -n "${DRAFT_MANIFEST_FILE:-}" ]] \
+      || die "SPEC_METHOD=dflash: lane $LANE pins no draft checkpoint (DRAFT_REPO, DRAFT_REV, DRAFT_NAME, DRAFT_BYTES, DRAFT_MANIFEST_FILE)"
+    [[ "$DRAFT_REV" =~ ^[0-9a-f]{40}$ ]] \
+      || die "DRAFT_REV must be a full 40-character commit sha (the fetch pins exactly that revision)"
+    [[ -f "$ROOT/$DRAFT_MANIFEST_FILE" ]] || die "draft manifest missing: $DRAFT_MANIFEST_FILE"
+    local draft_bytes
+    draft_bytes=$(awk -F'\t' '{s+=$2} END{printf "%d", s}' "$ROOT/$DRAFT_MANIFEST_FILE")
+    [[ "$draft_bytes" == "$DRAFT_BYTES" ]] \
+      || die "draft manifest totals $draft_bytes bytes, pin says $DRAFT_BYTES"
   fi
   if ! is_true "$PROFILE_MEASURED" && [[ -z "${M31_PROFILE_WARNED:-}" ]]; then
     log "WARNING: profile $PROFILE is UNMEASURED; do not publish its numbers"
@@ -403,8 +428,16 @@ cmd_print_serve() {
   )
   [[ "$rank" == 0 ]] && serve+=(--served-model-name "$SERVED_NAME" --host "$HOST" --port "$PORT")
   [[ "$rank" == 1 ]] && serve+=(--headless)
-  if [[ "$DSPARK" == 1 ]]; then
-    serve+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$NUM_SPECULATIVE_TOKENS,\"attention_backend\":\"$DRAFT_ATTN_BACKEND\",\"kv_cache_dtype\":\"$DRAFT_KV_DTYPE\",\"draft_sample_method\":\"$DRAFT_SAMPLE\",\"rejection_sample_method\":\"$REJECTION_SAMPLE\"}")
+  if [[ "$SPEC_METHOD" != none ]]; then
+    local spec_json
+    if [[ "$SPEC_METHOD" == dflash ]]; then
+      # DFlash2 does not ship inside the pack: it is its own checkpoint, pinned by the
+      # lane and mounted under /models beside the pack, so the draft needs a model path.
+      spec_json="{\"method\":\"dflash\",\"model\":\"/models/$DRAFT_NAME\",\"num_speculative_tokens\":$NUM_SPECULATIVE_TOKENS,\"attention_backend\":\"$DRAFT_ATTN_BACKEND\",\"kv_cache_dtype\":\"$DRAFT_KV_DTYPE\",\"draft_sample_method\":\"$DRAFT_SAMPLE\",\"rejection_sample_method\":\"$REJECTION_SAMPLE\"}"
+    else
+      spec_json="{\"method\":\"dspark\",\"num_speculative_tokens\":$NUM_SPECULATIVE_TOKENS,\"attention_backend\":\"$DRAFT_ATTN_BACKEND\",\"kv_cache_dtype\":\"$DRAFT_KV_DTYPE\",\"draft_sample_method\":\"$DRAFT_SAMPLE\",\"rejection_sample_method\":\"$REJECTION_SAMPLE\"}"
+    fi
+    serve+=(--speculative-config "$spec_json")
   fi
   if is_true "$EAGER"; then
     serve+=(--enforce-eager)
@@ -545,6 +578,17 @@ cmd_doctor() {
     fi
   done
 
+  # Draft checkpoint: quick size check when the serve selects one.
+  if [[ "$SPEC_METHOD" == dflash ]]; then
+    for r in 0 1; do
+      if remote "$r" "python3 '$TOOLS/verify_manifest.py' --pack '$DRAFT_DIR' --manifest '$BASE_DIR/draft-manifest.tsv' --quick" >/dev/null 2>&1; then
+        ok "rank $r draft sizes match the manifest ($DRAFT_NAME)"
+      else
+        bad "rank $r draft is missing or incomplete at $DRAFT_DIR (run ./m31.sh fetch)"
+      fi
+    done
+  fi
+
   # Model pack: quick size check when present.
   for r in 0 1; do
     if remote "$r" "test -d '$MODEL_DIR'"; then
@@ -618,10 +662,30 @@ cmd_fetch() {
     rsync -a --files-from="$PART" -e "ssh -o BatchMode=yes" "$MODEL_DIR/" "$PEER:$MODEL_DIR/"
   ' MODEL_DIR="$MODEL_DIR" PEER="$peer" PART="$BASE_DIR/run/part0.txt"
 
+  if [[ "$SPEC_METHOD" == dflash ]]; then
+    log "fetching the pinned draft: $DRAFT_REPO @ $(printf '%s' "$DRAFT_REV" | cut -c1-8)"
+    remote 0 '
+      set -euo pipefail
+      mkdir -p "$DRAFT_DIR"
+      "$HF" download "$REPO" --revision "$REV" --local-dir "$DRAFT_DIR"
+    ' DRAFT_DIR="$DRAFT_DIR" REPO="$DRAFT_REPO" REV="$DRAFT_REV" HF="$hf"
+    log "fanning the draft out to rank 1"
+    remote 0 '
+      set -euo pipefail
+      rsync -a -e "ssh -o BatchMode=yes" "$DRAFT_DIR/" "$PEER:$DRAFT_DIR/"
+    ' DRAFT_DIR="$DRAFT_DIR" PEER="$peer"
+  fi
+
   log "verifying every file on both nodes (sha256)"
   both "
     python3 '$TOOLS/verify_manifest.py' --pack '$MODEL_DIR' --manifest '$BASE_DIR/pack-manifest.tsv' --json '$BASE_DIR/run/verify.json'
   " MODEL_DIR="$MODEL_DIR"
+  if [[ "$SPEC_METHOD" == dflash ]]; then
+    log "verifying the draft on both nodes (sha256)"
+    both "
+      python3 '$TOOLS/verify_manifest.py' --pack '$DRAFT_DIR' --manifest '$BASE_DIR/draft-manifest.tsv'
+    " DRAFT_DIR="$DRAFT_DIR"
+  fi
   log "fetch complete: $MODEL_DIR ($(awk -F'\t' '{s+=$2} END{printf "%.1f GiB", s/1073741824}' "$ROOT/$MANIFEST_FILE")) per node"
 }
 
@@ -700,6 +764,7 @@ cmd_start() {
     remote "$r" '
       if test -d "$MODEL_DIR"; then echo pack_dir=1; else echo pack_dir=0; fi
       if python3 "$TOOLS/verify_manifest.py" --pack "$MODEL_DIR" --manifest "$BASE_DIR/pack-manifest.tsv" --quick >/dev/null 2>&1; then echo pack_sizes=1; else echo pack_sizes=0; fi
+      if [ -n "$DRAFT_DIR" ] && python3 "$TOOLS/verify_manifest.py" --pack "$DRAFT_DIR" --manifest "$BASE_DIR/draft-manifest.tsv" --quick >/dev/null 2>&1; then echo draft=1; else echo draft=0; fi
       if [ -f "$BASE_DIR/overlay.json" ]; then echo "overlay_sha=$(sha256sum "$BASE_DIR/overlay.json" | cut -d" " -f1)"; else echo overlay_sha=; fi
       # shellcheck disable=SC2086
       if python3 "$TOOLS/make_serve_config.py" --base "$MODEL_DIR/config.json" $OVERLAY_ARG --out "$BASE_DIR/serve-config.json" >/dev/null 2>&1; then
@@ -709,7 +774,7 @@ cmd_start() {
       fi
       echo "labels=$(docker image inspect "$IMAGE" --format "{{index .Config.Labels \"local.m31.base-digest\"}} {{index .Config.Labels \"local.m31.exl3\"}} {{index .Config.Labels \"local.m31.plugin\"}} {{index .Config.Labels \"local.m31.patch-sha256\"}}" 2>/dev/null || echo missing)"
       echo "foreign=$(docker ps --format "{{.Names}}" | tr "\n" " ")"
-    ' MODEL_DIR="$MODEL_DIR" TOOLS="$TOOLS" BASE_DIR="$BASE_DIR" IMAGE="$IMAGE" \
+    ' MODEL_DIR="$MODEL_DIR" DRAFT_DIR="$DRAFT_DIR" TOOLS="$TOOLS" BASE_DIR="$BASE_DIR" IMAGE="$IMAGE" \
       OVERLAY_ARG="${overlay_sha:+--overlay $BASE_DIR/overlay.json}" >"$RUN_DIR/preflight-rank$r.txt" 2>&1 &
   done
   wait
@@ -719,6 +784,8 @@ cmd_start() {
   for r in 0 1; do
     [[ "$(pf "$r" pack_dir)" == 1 ]] || die "rank $r has no pack at $MODEL_DIR (./m31.sh fetch)"
     [[ "$(pf "$r" pack_sizes)" == 1 ]] || die "rank $r pack sizes do not match the manifest"
+    [[ "$SPEC_METHOD" != dflash || "$(pf "$r" draft)" == 1 ]] \
+      || die "rank $r has no manifest-consistent draft at $DRAFT_DIR (./m31.sh fetch)"
     if [[ -n "$overlay_sha" ]]; then
       [[ "$(pf "$r" overlay_sha)" == "$overlay_sha" ]] || die "rank $r overlay differs from $OVERLAY_FILE"
     fi
@@ -900,7 +967,7 @@ cmd_api_test() {
 }
 cmd_probe() {
   python3 "$ROOT/bench/probe.py" --base-url "$URL" --model "$SERVED_NAME" ${API_KEY:+--api-key "$API_KEY"} \
-    --dspark "$DSPARK" "$@"
+    --dspark "$SPEC_ON" "$@"
 }
 cmd_bench() {
   python3 "$ROOT/bench/bench.py" --base-url "$URL" --model "$SERVED_NAME" ${API_KEY:+--api-key "$API_KEY"} \
@@ -919,7 +986,9 @@ cmd_tools() {
 cmd_status() {
   need_hosts
   both '
-    echo "container: $(docker inspect -f "{{.Status}}" "$CONTAINER" 2>/dev/null || echo absent)"
+    # Docker 29 has no top-level "Status" key in the inspect map: {{.Status}} fails to
+    # parse, so status reported "absent" for a rank that was running. {{.State.Status}} is.
+    echo "container: $(docker inspect -f "{{.State.Status}}" "$CONTAINER" 2>/dev/null || echo absent)"
     echo "MemAvailable: $(awk "/MemAvailable/{printf \"%.1f GiB\", \$2/1048576}" /proc/meminfo)"
     tail -1 "$BASE_DIR/run/guard.log" 2>/dev/null || true
   ' BASE_DIR="$BASE_DIR" CONTAINER="$CONTAINER"

@@ -66,6 +66,7 @@ Everything that goes into the served stack is fixed in [`config/pins.sh`](config
 | exllamav3 patches | `patches/exllamav3/0001`-`0003` | this repo |
 | Plugin patches | `patches/0001`-`0019` | this repo |
 | Weights | `vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw` @ `99bf3a57`; `config/lanes/2.15bpw/pack-manifest.tsv` (40 files, sha256 + size, 118,985,525,140 bytes) | Hugging Face |
+| Draft, if `SPEC_METHOD=dflash` | `incoai/MiniMax-M3.1-Flash-DFlash2` @ `ac07a7c1`; `config/lanes/2.15bpw/dflash2-manifest.tsv` (5 files, sha256 + size, 4,248,070,981 bytes) | Hugging Face |
 
 **How the build uses the pins:**
 - **Engine sources.** `build` fetches each pinned commit by its full sha on rank 0 (a full sha names exactly one
@@ -73,7 +74,8 @@ Everything that goes into the served stack is fixed in [`config/pins.sh`](config
   LICENSE and NOTICE files. The Docker build itself downloads nothing.
 - **Image identity.** The image tag and labels carry the plugin revision and one sha256 over both patch series.
   `start` refuses an image whose labels don't match the pins.
-- **Weights.** `fetch` downloads the pinned revision and checks every file's sha256 against the manifest.
+- **Weights.** `fetch` downloads the pinned revision and checks every file's sha256 against the manifest. With
+  `SPEC_METHOD=dflash` it does the same for the pinned draft, which is a separate model under its own license.
 
 The engine commits and the base image live outside this repo. If a pinned commit or the base digest ever
 disappears upstream, the build stops rather than building something else.
@@ -222,7 +224,7 @@ Precedence: caller environment > `.env` > `m31.sh` defaults > the profile. Pins 
 | `KV_BYTES_PER_TOKEN` | `28160` | derivation constant; the measured cost is 27,520 bytes/token/rank (q4 main KV, fp8 indexer, fp8 draft) |
 | `KV_Q4` / `KV_CACHE_DTYPE` | `1` / `nvfp4` | q4 main-KV pool through `VLLM_EXL3_Q4KV`; requires the fp8 indexer and fp8 draft |
 | `INDEXER_KV_DTYPE` / `INDEXER_MXFP8` | `fp8` / `1` | indexer cache and its on-device MXFP8 retention |
-| `DSPARK` / `NUM_SPECULATIVE_TOKENS` | `1` / `3` | the draft ships inside the pack; k=3 verifies up to 4 tokens per step |
+| `SPEC_METHOD` / `NUM_SPECULATIVE_TOKENS` | empty (follows `DSPARK`, so `dspark`) / `3` | drafter: `dspark` is the draft that ships inside the pack, `dflash` is the DFlash2 draft the lane pins (`fetch` pulls and verifies it, `start` refuses to serve without it), `none` disables speculation; k=3 verifies up to 4 tokens per step. `DSPARK=0`/`1` remains the legacy spelling of `none`/`dspark` |
 | `DRAFT_ATTN_BACKEND` / `DRAFT_KV_DTYPE` | `TRITON_ATTN` / `fp8` | the only fp8-draft pair that boots on GB10 |
 | `MAX_NUM_BATCHED_TOKENS` | profile (16384) | chunked-prefill chunk; a multiple of 128 |
 | `FAT_THRESHOLD` / `FAT_THRESHOLD_PREFILL` / `FAT_PREFILL_TOKENS` | profile (128 / 0 / 1024) | experts above the row threshold take the grouped fat GEMM; batches of ≥ `FAT_PREFILL_TOKENS` tokens use the prefill threshold. `FAT_THRESHOLD` also caps coop decode eligibility |
