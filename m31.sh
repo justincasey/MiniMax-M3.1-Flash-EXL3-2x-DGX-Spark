@@ -919,7 +919,9 @@ cmd_tools() {
 cmd_status() {
   need_hosts
   both '
-    echo "container: $(docker inspect -f "{{.Status}}" "$CONTAINER" 2>/dev/null || echo absent)"
+    # Docker 29 has no top-level "Status" key in the inspect map: {{.Status}} fails to
+    # parse, so status reported "absent" for a rank that was running. {{.State.Status}} is.
+    echo "container: $(docker inspect -f "{{.State.Status}}" "$CONTAINER" 2>/dev/null || echo absent)"
     echo "MemAvailable: $(awk "/MemAvailable/{printf \"%.1f GiB\", \$2/1048576}" /proc/meminfo)"
     tail -1 "$BASE_DIR/run/guard.log" 2>/dev/null || true
   ' BASE_DIR="$BASE_DIR" CONTAINER="$CONTAINER"
