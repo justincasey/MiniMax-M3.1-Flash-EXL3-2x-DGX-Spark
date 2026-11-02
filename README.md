@@ -64,7 +64,7 @@ Everything that goes into the served stack is fixed in [`config/pins.sh`](config
 | exllamav3 | [`vcruz305/exllamav3`](https://github.com/vcruz305/exllamav3) @ `fdd77361` (vcruz305's fork of turboderp-org/exllamav3 with the act-3 MoE fix) | GitHub |
 | vllm-exl3 | [`vcruz305/vllm-exl3`](https://github.com/vcruz305/vllm-exl3) @ `053c634d` | GitHub |
 | exllamav3 patches | `patches/exllamav3/0001`-`0003` | this repo |
-| Plugin patches | `patches/0001`-`0019` | this repo |
+| Plugin patches | `patches/0001`-`0020` | this repo |
 | Weights | `vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw` @ `99bf3a57`; `config/lanes/2.15bpw/pack-manifest.tsv` (40 files, sha256 + size, 118,985,525,140 bytes) | Hugging Face |
 | Draft, if `SPEC_METHOD=dflash` | `incoai/MiniMax-M3.1-Flash-DFlash2` @ `ac07a7c1`; `config/lanes/2.15bpw/dflash2-manifest.tsv` (5 files, sha256 + size, 4,248,070,981 bytes) | Hugging Face |
 
@@ -74,6 +74,10 @@ Everything that goes into the served stack is fixed in [`config/pins.sh`](config
   LICENSE and NOTICE files. The Docker build itself downloads nothing.
 - **Image identity.** The image tag and labels carry the plugin revision and one sha256 over both patch series.
   `start` refuses an image whose labels don't match the pins.
+- **Series state.** Patch `0020` (q4 slice planner) is in the series here, so `PATCH_SHA256` and therefore the default
+  image tag differ from the image every measured number in [PERFORMANCE.md](PERFORMANCE.md) and `bench/records/` was
+  produced on (`053c634d`-`8d9c23f6`, 19 patches). Run `./m31.sh build` before `start` on this revision, and re-run
+  `bench all` before treating any old record as describing it.
 - **Weights.** `fetch` downloads the pinned revision and checks every file's sha256 against the manifest. With
   `SPEC_METHOD=dflash` it does the same for the pinned draft, which is a separate model under its own license.
 
@@ -304,7 +308,7 @@ mandatory. If `start` dies with `GUARD KILL`, read `~/m31/run/guard.log` and the
 
 This repository mixes three licenses:
 - **Apache-2.0** ([LICENSE](LICENSE)): the scripts and documentation.
-- **AGPL-3.0-only:** the plugin patches (`patches/0001`-`0019`), because `vllm-exl3` is AGPL. If you distribute an
+- **AGPL-3.0-only:** the plugin patches (`patches/0001`-`0020`), because `vllm-exl3` is AGPL. If you distribute an
   image built from them, you must also offer the corresponding source.
 - **MIT:** the exllamav3 patches.
 

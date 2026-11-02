@@ -1,13 +1,13 @@
 # Patches
 
-The plugin series (`patches/0001`-`0019`) is **AGPL-3.0-only**, because the plugin it patches is AGPL-3.0-only. The
+The plugin series (`patches/0001`-`0020`) is **AGPL-3.0-only**, because the plugin it patches is AGPL-3.0-only. The
 exllamav3 series (`patches/exllamav3/`) is **MIT**, like exllamav3. The rest of the repository is Apache-2.0
 (`LICENSE`); these files are not. `./m31.sh build` applies them in order (`PATCH_FILES` in
 `config/pins.sh`), and the image tag and `local.m31.patch-sha256` label carry one sha256 over the series.
 
 **How they are applied.** `./m31.sh build` fetches `vcruz305/vllm-exl3` at
 `053c634db54afc981becfb46c0482e7358cc00ba` (pinned in `config/pins.sh`), exports it with `git archive`, then applies
-`0001`-`0019` in order with `git apply --check` first. The exllamav3 series in `patches/exllamav3/` is applied the same
+`0001`-`0020` in order with `git apply --check` first. The exllamav3 series in `patches/exllamav3/` is applied the same
 way to `vcruz305/exllamav3` at `fdd77361`. `python3 tests/test_pack_layout.py` runs the same staging step.
 
 **Authors.** `0001` is derived from tonyd2wild's TP=2 LM-head change and `0002` is his file byte for byte
@@ -411,6 +411,33 @@ runs one `exl3_moe_coop_mk` launch per stage (rot, gate/up, down), with per-expe
 
 Intermediates are bit-identical (`tests/gpu/test_fat_gemm_grouped.py`). The layer output differs by ≤ 2.4e-7, from
 atomic order only. On real 16K-chunk routing: 78.9 → 72.5 ms per MoE layer.
+
+## `0020-minimax-exl3-q4-slice-planner-v2.patch`
+
+**License:** AGPL-3.0-only. Ours.
+
+**O(rows × routes) q4 prefill slice planner.** `plan_prefill_slices_fast` partitions a prefill chunk's queries into
+runs whose selected-page union fits the 48 MiB staging buffer (384 pages per rank at 2 KV heads). When one request's
+own union exceeds the cap it builds a `[rows, nb]` page bitmap and, for **every** slice start `a`, runs
+`_union_curve(a)` → `_first_row_at_or_after(a)`: an `[(rows − a), nb]` int64 where/amin. `nb` is the **physical pool
+size**, not the prompt length — at `KVB=20 GB` per rank over 60 layers that is **9,042 pages**, so one call is 1.1 GiB
+and a long-context chunk needs 6-40 of them.
+
+`cov(a+k) = #{page : first[page] < a+k}` is nondecreasing in `k`, so the greedy's answer — the largest `k` with
+`cov(a+k) ≤ cap` — is exactly `first_sorted[cap] − a`: one ascending sort of `nb` elements per slice, and the slice's
+page list is what that sort already ordered. No `[rows, nb]` tensor is ever built.
+
+Same greedy, same maximal ranges, same hard floor, same ascending page order, same `-1` handling. Host transfers go
+from one per slice (the reference's `searchsorted(...).tolist()`) to two device scalars per slice — `O(slices)` either
+way, never `O(slices × rows)`. Plan and page lists identical to the reference (25/25 cases in
+`tests/test_q4kv_slice_planner.py`, including the 611/567/306/174-slice splits at the served pool width), and the
+attention output is bit-identical through the served wrapper. `VLLM_EXL3_Q4KV_PLANNER_V2` defaults to off; unset selects the pre-0020 path byte for byte, and a
+malformed value fails closed. `m31.sh` sets `=1`.
+
+Measured on GB10 at the served geometry, 16K-token chunk: plan 69.8 → 2.57 ms per layer over a 192K prefix (27×),
+43.5 → 2.2 ms at 48K (20×); the whole prefill sparse-attention operation 4.3× / 3.5× / 5.8× at 192K / 48K / 112K
+prefixes. Neutral at a prefix of 0 (10.07 → 10.05 ms), where the request's union fits the cap and the per-query path
+is never entered.
 
 ## exllamav3 patches (`patches/exllamav3/`, `EXL3_PATCH_FILES`)
 

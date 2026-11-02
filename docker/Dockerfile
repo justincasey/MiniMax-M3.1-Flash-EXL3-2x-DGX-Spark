@@ -8,7 +8,7 @@
 #   +    : exllamav3 at EXL3_REV (vcruz305's fork with the act-3 batched-MoE
 #          fix) plus patches/exllamav3/0001-0003 (coop MoE decode, dense
 #          decode GEMV), with the plugin's aarch64 CPU-path patch.
-#   +    : vllm-exl3 at PLUGIN_REV (vcruz305) plus patches/0001-0019: TP=2
+#   +    : vllm-exl3 at PLUGIN_REV (vcruz305) plus patches/0001-0020: TP=2
 #          enablement, weight snapshots, prefill and decode kernels.
 #          PATCH_SHA256 covers both series.
 
@@ -52,6 +52,9 @@ RUN set -eux; \
     grep -q "def _mixedk_m_tile" /opt/vllm-exl3-local/src/vllm_exl3/exl3.py; \
     grep -q "_COOP_SPLIT_MAX_TOKENS" /opt/vllm-exl3-local/src/vllm_exl3/exl3.py; \
     test -f /opt/vllm-exl3-local/src/vllm_exl3/sparse_attn_tiled.py; \
+    test -f /opt/vllm-exl3-local/src/vllm_exl3/slice_planner.py; \
+    grep -q "def plan_prefill_slices_v2" /opt/vllm-exl3-local/src/vllm_exl3/slice_planner.py; \
+    grep -q VLLM_EXL3_Q4KV_PLANNER_V2 /opt/vllm-exl3-local/src/vllm_exl3/minimax_q4kv.py; \
     grep -q FAT_THRESHOLD_PREFILL /opt/vllm-exl3-local/src/vllm_exl3/exl3.py
 
 LABEL local.m31.base-digest="${BASE_IMAGE_DIGEST}" \

@@ -401,6 +401,14 @@ cmd_print_serve() {
     # Wide (128-column, 4-way k-split) coop tile on both MoE decode stages: 8-15% faster coop
     # launches on this pack's per-rank shapes (exllamav3 picks narrow for K=1536 by default).
     -e EXL3_MOE_COOP_WIDE=1
+    # patch 0020: exact per-row q4 slice spans instead of the dense [rows, pool_pages] mask.
+    # The planner is 74-77% of the prefill sparse-attention operation at prefixes >= 48K (pool
+    # pages per rank per layer here: 9042). Prefill at 146K natural tokens: 236 -> 885 tok/s,
+    # TTFT 621 s -> 166 s; 8K/16K/48K unchanged; the plan and the attention output are
+    # bit-identical (docs/RECIPE_DECISIONS.md). Unset this to get the pre-0020 path back
+    # byte for byte with no rebuild; the variable is part of the weight-snapshot key, so
+    # that rollback costs one full weight load on the next boot.
+    -e VLLM_EXL3_Q4KV_PLANNER_V2=1
     -e "VLLM_EXL3_WEIGHT_SNAPSHOT=$WEIGHT_SNAPSHOT" -e VLLM_EXL3_WEIGHT_SNAPSHOT_DIR=/cache/weight-snapshots
     -e VLLM_TRITON_JIT_WARMUP_NUM_THREADS=1 -e TORCHINDUCTOR_COMPILE_THREADS=1
     -e TRITON_CACHE_DIR=/cache/triton -e CUDA_CACHE_PATH=/cache/nv-compute

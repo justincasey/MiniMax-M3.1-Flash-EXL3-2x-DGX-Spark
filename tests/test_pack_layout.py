@@ -191,9 +191,17 @@ def run_prepare_src(p: dict, build: str, **overrides) -> subprocess.CompletedPro
 
 # Digests of the two engine trees in the build context that was validated on hardware (both patch series applied).
 # A pin or patch change is a release: rebuild, re-validate, then update these.
+#
+# vllm-exl3-src moved from 4a2bc6c8... to 2014b3c3... with patch 0020 (two python files: the new slice_planner.py and
+# one call site in minimax_q4kv.py; no CUDA source, so the compiled extensions are unaffected). It was validated on the
+# GB10 pair as a python-only overlay of the serving image carrying exactly those two files: 25/25 plan-equality cases
+# (tests/test_q4kv_slice_planner.py), bit-identical attention output through the served wrapper, and a full serving
+# matrix (prefill 8K/16K/48K/128K synthetic + 146K natural prose, decode c=1/c=4, mixed load, NLL, needle, quality,
+# tools, api). The full `./m31.sh build` of this series and a fresh bench/records entry are still owed before any of
+# those numbers are quoted in README.md or PERFORMANCE.md.
 VALIDATED_TREES = {
     "exllamav3-src": "06d5af1de8eb66454c17298e905d5cd1aee68961929a474ed42ff993d53ca132",
-    "vllm-exl3-src": "4a2bc6c875a33d10e750d90c918a6a02f7f4f48957fa784274a9c555abecb31a",
+    "vllm-exl3-src": "2014b3c3b7d0630fd58967ee65c57781aaa7609cd69c7fe170177cb8a00a1bfd",
 }
 
 
