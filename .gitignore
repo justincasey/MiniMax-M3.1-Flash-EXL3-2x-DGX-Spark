@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .ruff_cache/
 *.download.log
+# written by `./m31.sh bench pin` (bench/bench.py step_pin) from the HF goldens; not a source
+bench/reference.json

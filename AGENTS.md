@@ -36,6 +36,7 @@ serves and the measurement record says so.
 ```bash
 bash tests/test_recipe.sh
 python3 tests/test_pack_layout.py          # also fetches both pinned commits and applies both patch series
+python3 tests/test_q4kv_slice_planner.py   # patch 0020 plan equality; --all plus a GPU adds the served geometry
 python3 -m py_compile bench/*.py scripts/*.py tests/*.py
 ```
 

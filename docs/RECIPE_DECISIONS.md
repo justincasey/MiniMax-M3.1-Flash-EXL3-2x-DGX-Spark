@@ -56,6 +56,30 @@ Decisions behind the 2.15 bpw TP=2 lane, each with its evidence, so the next rec
   - pinning to the performance cores;
   - 256-row fat GEMM tiles;
   - FP8 dense prefill: it is opt-in and off, because its error is about 10× bf16's.
+- **patch 0020 — the q4 slice planner is the long-context prefill cost, not the attention.** `plan_prefill_slices_fast`
+  evaluates its greedy union for *every* slice start, which costs `O(slices × rows × nb)` and allocates a `[rows, nb]`
+  int64 per call. At a 16K chunk over a 192K prefix that is 69.8 ms of the 91.8 ms sparse-attention operation per layer
+  (74-77%). `cov(a+k)` is monotone in `k`, so the greedy's answer is `first_sorted[cap] − a` and no `[rows, nb]` tensor
+  is needed: 69.8 → 2.57 ms, plan and page lists identical, attention output bit-identical. On the server, a 146K-token
+  natural-prose prompt went 236 → 885 tok/s and TTFT 621 → 166 s; 8K/16K/48K were unchanged, because below a ~48K prefix
+  the request's own page union fits the 384-page staging cap and the per-query split path is never entered. The numbers are lab records (kernel-lab, branch
+  kernel-lab-phase3), not a `bench/records/` entry; they are quoted nowhere in README or PERFORMANCE. The gate is
+  `tests/test_q4kv_slice_planner.py` (25 cases, plan-equality against the reference, including the 611-slice split at the
+  served pool width). `VLLM_EXL3_Q4KV_PLANNER_V2` unset returns the old path byte for byte, with no rebuild — but the
+  variable is folded into the weight-snapshot key (`weight_snapshot.py` hashes every `VLLM_EXL3_*` outside
+  `APPLY_ONLY_ENV`), so flipping it invalidates the snapshot and the next boot pays a full weight load. The rollback is
+  cheap, not free.
+- **`nb` in the q4 planner is the physical pool, not the prompt.** Every sizing judgement about the prefill attention
+  has to use pool pages per rank per layer — 9,042 at `KVB=20 GB` over 60 layers with 36,864-byte pages — not
+  `ceil(seq/128)`. A first pass that used prompt blocks understated the planner's memory by up to 70× and hid the whole
+  finding. Get it from the pool: `KVB` per rank ÷ 60 layers = 333,333,333 bytes per layer, ÷ 36,864 bytes per page =
+  9,042 pages. The same `nb` is what `_selected_page_bitmap` sizes its `[rows, nb]` mask by.
+- **A kernel-backend knob can be inert, so verify the kernel line before timing it.** `linear_backend_per_quant`
+  covers the MXFP8 projections, and with `SPEC_METHOD=dflash` those projections are never built (the DFlash2
+  draft is bf16): the boot log loses the `Using …Mxfp8LinearKernel` line entirely, and the flag reaches the
+  config while changing nothing. An A/B/A run that way came out flat to ±5%, which measured boot noise, not
+  the backends. Read the kernel-selection line in the rank log first; `bench check` passes either way and
+  proves nothing about which kernel ran.
 
 ## Fabric
 

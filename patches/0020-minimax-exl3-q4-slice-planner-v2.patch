@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rodman80 <rodman80@users.noreply.github.com>
+Date: Thu, 2 Nov 2026 13:30:00 -0300
+Subject: [PATCH] O(queries x routes) q4 prefill slice planner behind
+ VLLM_EXL3_Q4KV_PLANNER_V2
+
+plan_prefill_slices_fast partitions a prefill chunk's queries into runs whose selected-page
+union fits the 48 MiB staging buffer (384 pages per rank at 2 KV heads). When one request's
+own union exceeds the cap it builds a [rows, nb] page bitmap and, for EVERY slice start a,
+calls _union_curve(a) -> _first_row_at_or_after(a): an [(rows - a), nb] int64 where/amin.
+nb is the PHYSICAL pool size, not the prompt length: at KVB=20 GB per rank over 60 layers
+that is 9,042 pages, so one call is 1.1 GiB and a long-context chunk needs 6-40 of them.
+
+Measured on GB10 at the served geometry (kernel-lab/results/a3_planner.json), 16K-token
+chunk: plan 69.8 ms -> 2.57 ms per layer over a 192K prefix (27x), 43.5 -> 2.2 ms at 48K
+(20x), and the whole prefill sparse-attention operation 4.3x / 3.5x / 5.8x at 192K / 48K /
+112K prefixes. At a prefix of 0 the request's union fits the cap, the per-query path is
+never entered, and the change is neutral (10.07 -> 10.05 ms).
+
+cov(a+k) = #{page : first[page] < a+k} is nondecreasing in k, so the greedy's answer -- the
+largest k with cov(a+k) <= cap -- is exactly first_sorted[cap] - a: one ascending sort of nb
+elements per slice, and the slice's page list is what that sort already ordered. No
+[rows, nb] tensor is built.
+
+Same greedy, same maximal ranges, same hard floor, same ascending page order, same -1
+handling. Host transfers go from one per slice (the reference's searchsorted(...).tolist())
+to two device scalars per slice -- O(slices) either way, never O(slices x rows), and the
+plan is unaffected. The plan and every page list are identical to the reference planner
+(tests/test_q4kv_slice_planner.py), so the staged bf16 bytes and the attention output are
+bit-identical. Default OFF: unset selects the reference planner byte for byte; a malformed
+value raises rather than silently selecting a path.
+
+Part of the plugin series (config/pins.sh PATCH_FILES), so it is in both the pack-builder
+and the serve image. The serve env sets VLLM_EXL3_Q4KV_PLANNER_V2=1 (m31.sh); unsetting it
+returns the pre-0020 code path byte for byte with no rebuild, which is the rollback. The
+Dockerfile self-checks assert slice_planner.py exists, that it defines
+plan_prefill_slices_v2, and that the switch is present in minimax_q4kv.py. Plan equality is
+checked against the reference planner by tests/test_q4kv_slice_planner.py in this lane.
+---
+ src/vllm_exl3/minimax_q4kv.py  |  39 ++++++++++++++++++++++++++++++++++++++-
+ src/vllm_exl3/slice_planner.py | 141 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 179 insertions(+), 1 deletion(-)
+
+diff -ruN a/src/vllm_exl3/minimax_q4kv.py b/src/vllm_exl3/minimax_q4kv.py
+--- a/src/vllm_exl3/minimax_q4kv.py	2026-11-01 21:20:58.000000000 -0300
++++ b/src/vllm_exl3/minimax_q4kv.py	2026-11-02 13:29:50.033206115 -0300
+@@ -97,6 +97,7 @@
+ import torch
+ 
+ from vllm_exl3 import minimax_q4kv_reference as ref
++from vllm_exl3 import slice_planner as _slice_planner
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -574,6 +575,38 @@
+ _SPARSE_TILED_MIN_ROWS = int(os.environ.get("VLLM_EXL3_SPARSE_TILED_MIN_ROWS", "1024"))
+ 
+ 
++def _planner_v2_enabled() -> bool:
++    """VLLM_EXL3_Q4KV_PLANNER_V2: the O(queries x routes) q4 slice planner.
++
++    Default OFF: ``minimax_q4kv_reference.plan_prefill_slices_fast`` runs byte for byte.
++
++    ``=1`` selects :func:`vllm_exl3.slice_planner.plan_prefill_slices_v2`, which returns
++    the SAME slices, the SAME query ranges and the SAME ascending page lists, but costs
++    O(rows x nkv x topk) instead of O(slices x rows x nb). ``nb`` is the physical pool
++    size (9,042 pages per rank per layer at KVB=20 GB over 60 layers), and the reference
++    planner builds an ``[(rows - a), nb]`` int64 tensor per slice start -- 1.1 GiB per
++    slice at the served geometry. GB10 measurement at a 16K chunk over a 192K prefix:
++    plan 69.8 ms -> 2.57 ms per layer, whole prefill sparse-attention operation 4.3x
++    faster, plan and attention output bit-identical.
++
++    Read per call (an ``os.environ`` lookup on the prefill path, which never runs under
++    capture). Unset or empty is OFF; anything outside 0/1/true/false/on/off/yes/no raises
++    on the first prefill, so a typo cannot quietly select a planner.
++    """
++    raw = os.environ.get("VLLM_EXL3_Q4KV_PLANNER_V2")
++    if raw is None:
++        return False
++    val = raw.strip().lower()
++    if val in ("1", "true", "on", "yes"):
++        return True
++    if val in ("0", "false", "off", "no", ""):
++        return False
++    raise ValueError(
++        "VLLM_EXL3_Q4KV_PLANNER_V2 must be unset or one of "
++        f"0/1/true/false/on/off/yes/no, got {raw!r}"
++    )
++
++
+ def _make_prefill_wrapper(original):
+     def minimax_m3_sparse_attn(
+         q,
+@@ -649,7 +682,11 @@
+         # timing, 32K serve needles) is in CHECKIN-Q4KV-1.md.
+         fast = _prefill_fast_enabled()
+         if fast:
+-            plan = ref.plan_prefill_slices_fast
++            # VLLM_EXL3_Q4KV_PLANNER_V2 swaps only the planner; the slice plan it must
++            # produce is identical, so the staged bytes and the attention result are
++            # unchanged (see slice_planner's module docstring).
++            plan = (_slice_planner.plan_prefill_slices_v2 if _planner_v2_enabled()
++                    else ref.plan_prefill_slices_fast)
+             fill = q4kernels.q4_stage_pages
+         else:
+             plan = ref.plan_prefill_slices
+diff -ruN a/src/vllm_exl3/slice_planner.py b/src/vllm_exl3/slice_planner.py
+--- a/src/vllm_exl3/slice_planner.py	1969-12-31 21:00:00.000000000 -0300
++++ b/src/vllm_exl3/slice_planner.py	2026-11-02 13:29:49.984798180 -0300
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""O(queries x routes) q4 prefill slice planner.
++
++``minimax_q4kv_reference.plan_prefill_slices_fast`` partitions the chunk's queries into
++runs whose selected-page union fits the staging buffer (``VLLM_EXL3_Q4KV_STAGING_MAX_MB``,
++48 MiB = 384 pages per rank at 2 KV heads). When one request's own union exceeds the cap
++it builds a ``[rows, nb]`` page bitmap and calls ``_greedy_row_slices_fast``, which for
++EVERY slice start ``a`` calls ``_union_curve(a)`` -> ``_first_row_at_or_after(a)``: an
++``[(rows - a), nb]`` int64 where/amin. ``nb`` is the PHYSICAL pool size, not the prompt
++length: at ``KVB=20 GB`` per rank over 60 layers that is 9,042 pages, so one call is
++1.1 GiB and a long-context chunk needs 6-40 of them. Measured on GB10 at the served
++geometry: 69.8 ms per layer at a 16K chunk over a 192K prefix, 77% of the whole
++sparse-attention operation (``kernel-lab/results/a3_planner.json``).
++
++The identity that makes it cheap: for a slice starting at row ``a``,
++
++    cov(a + k) = |union of the pages of rows [a, a+k)|
++               = #{page : first[page] < a + k}
++
++where ``first[page]`` is the first row >= a that selects the page. ``cov`` is
++nondecreasing in ``k``, so the greedy's answer -- the largest ``k`` with
++``cov(a+k) <= cap`` -- is exactly ``first_sorted[cap] - a``. One ascending sort of ``nb``
++elements per slice, and the slice's page list is the set of pages that same sort already
++ordered, so ``bitmap[lo:hi].any(0).nonzero()`` disappears too. No ``[rows, nb]`` tensor
++is ever built.
++
++Semantics are preserved exactly: same greedy, same maximal ranges, same hard floor of one
++row when a row alone exceeds the cap, same ascending page order, same ``-1`` handling. Host
++transfers go from one per slice (the reference's ``searchsorted(...).tolist()``) to two
++device scalars per slice -- O(slices) either way, never O(slices x rows). The plan and
++every slice's page list are identical to the reference planner, pinned by
++``tests/test_q4kv_slice_planner.py`` over cases from one row to 16,384 rows, pool widths 8
++to 9,042, caps 1 to 20,000, ``-1`` sentinels, skewed and uniform page popularity, many reqs.
++
++Selected by ``VLLM_EXL3_Q4KV_PLANNER_V2=1`` (default off: the reference planner runs
++byte for byte). Any other value fails closed.
++"""
++
++from __future__ import annotations
++
++import torch
++
++
++def _row_pairs(phys: torch.Tensor, lo: int, hi: int, nb: int):
++    """(rows, pages) pair lists for rows [lo, hi) of one request, row-major and sorted by
++    row. Invalid (-1) entries go to a dummy column nb, never to a real page."""
++    nkv, length, topk = phys.shape
++    # permute before reshape: phys is [nkv, length, topk] and the pair list must be
++    # grouped by ROW, which is axis 1, not axis 0.
++    p = phys[:, lo:hi, :].permute(1, 0, 2).reshape(length, nkv * topk)
++    pages = torch.where(p >= 0, p, torch.full_like(p, nb))
++    rows = torch.arange(length, device=p.device, dtype=torch.int64)[:, None] \
++        .expand(-1, nkv * topk)
++    return rows.reshape(-1), pages.reshape(-1)
++
++
++def greedy_row_slices(phys: torch.Tensor, max_pages: int, nb: int):
++    """Same partition as ``_greedy_row_slices_fast`` over the ``[length, nb]`` page
++    bitmap of ``phys``.
++
++    Returns ``[(start, end, pages)]`` with ascending unique page ids. Only called when one
++    request's union already exceeds the cap, so ``plan_prefill_slices_v2`` never takes the
++    ``max_pages >= nb`` branch; that branch is here for standalone use of this helper.
++    """
++    length = phys.shape[1]
++    if length == 0:
++        return []
++    dev = phys.device
++    per_row = phys.shape[0] * phys.shape[2]
++    rows, pages = _row_pairs(phys, 0, length, nb)
++    sentinel = length
++    out = []
++    a = 0
++    while a < length:
++        # rows is [0]*per_row, [1]*per_row, ... so the suffix at row a starts at
++        # a * per_row: no searchsorted, no device read.
++        r_suf = rows[a * per_row:]
++        p_suf = pages[a * per_row:]
++        first = torch.full((nb + 1,), sentinel, dtype=torch.int64, device=dev)
++        first.scatter_reduce_(0, p_suf, r_suf, reduce="amin")
++        f = first[:nb]
++        if max_pages < nb:
++            val, order = torch.sort(f)          # ascending; order is the page id
++            k = int(val[max_pages].item()) - a
++            if k <= 0:
++                k = 1                            # hard floor: one row alone
++            k = min(k, length - a)
++            npages = int((val < a + k).sum().item())
++            pl = order[:npages]
++        else:
++            k = length - a
++            keep = f < length
++            pl = torch.nonzero(keep, as_tuple=False).reshape(-1)
++        out.append((a, a + k, pl.sort().values.to(torch.int64)))
++        a += k
++    return out
++
++
++def plan_prefill_slices_v2(pool, block_table, topk_idx, cu_seqlens_q, num_kv_heads,
++                           max_pages):
++    """Drop-in for ``minimax_q4kv_reference.plan_prefill_slices_fast``.
++
++    Same slice plan (same greedy, same tie-breaks, same hard floor, same page lists and
++    their ascending order), but the per-request split costs O(rows x nkv x topk) instead
++    of O(slices x rows x nb). The request-level greedy stays on the reference code path:
++    with at most ``max_num_seqs`` requests it is already trivial.
++    """
++    from vllm_exl3 import minimax_q4kv_reference as ref
++
++    nb, slots, tokens, width = pool.shape
++    if (slots != 2 * num_kv_heads or tokens != ref.POOL_BLOCK_SIZE
++            or width != ref.ROW_BYTES):
++        raise ValueError("pool must be [nb, 2*num_kv_heads, 128, 72] uint8")
++    if max_pages < 1:
++        raise ValueError("max_pages must be >= 1")
++    req_bitmap, phys, _ = ref._selected_page_bitmap(
++        pool, block_table, topk_idx, cu_seqlens_q)
++    cu = cu_seqlens_q.to(torch.int64).tolist()
++    total_q = topk_idx.shape[1]
++    if (cu[0] != 0 or cu[-1] != total_q
++            or any(b < a for a, b in zip(cu, cu[1:]))):
++        raise ValueError("cu_seqlens_q must start at 0, be non-decreasing, and cover "
++                         f"the {total_q}-query axis of topk_idx")
++
++    def row_union(bitmap, lo, hi):
++        return bitmap[lo:hi].any(0).nonzero().reshape(-1).to(torch.int64)
++
++    slices = []
++    for rs, re_ in ref._greedy_row_slices_fast(req_bitmap, max_pages):
++        pages = row_union(req_bitmap, rs, re_)
++        if re_ - rs == 1 and int(pages.numel()) > max_pages:
++            r = rs
++            lo, hi = cu[r], cu[r + 1]
++            for qs, qe, pl in greedy_row_slices(phys[:, lo:hi, :], max_pages, nb):
++                slices.append({"reqs": [r], "q": (lo + qs, lo + qe), "pages": pl})
++        else:
++            slices.append({"reqs": list(range(rs, re_)), "q": (cu[rs], cu[re_]),
++                           "pages": pages})
++    for s in slices:
++        s["n"] = int(s["pages"].numel())
++    return slices

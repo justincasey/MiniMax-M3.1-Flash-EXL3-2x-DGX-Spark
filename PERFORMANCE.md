@@ -4,6 +4,10 @@ The serving stack is the image built from this release: `vllm-exl3` `053c634d` +
 `exllamav3` `fdd77361` + `patches/exllamav3/0001`-`0003`, on the pinned vLLM base image. It ran on two
 pairs of DGX Sparks (GB10), each pair joined by one QSFP cable at TP=2.
 
+Everything below was measured on that 19-patch image (`m31-flash-exl3-tp2:053c634d-8d9c23f6`). Patch `0020` has since
+joined the series, which changes the series sha and the default image tag
+(`053c634d-70d628ae`): rebuild and re-run `bench all` before reading these numbers as describing that image.
+
 **Status:** these are benchmark runs, not a committed `bench/records/` run. Every profile is still marked
 `PROFILE_MEASURED=0`.
 

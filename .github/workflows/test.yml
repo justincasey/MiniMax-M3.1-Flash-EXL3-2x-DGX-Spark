@@ -21,3 +21,9 @@ jobs:
         run: bash tests/test_recipe.sh
       - name: Pack layout and staging
         run: python3 tests/test_pack_layout.py
+      # The q4 slice planner gate is pure python (torch on CPU), so it runs here; the
+      # served-geometry cases (nb 9042 x 16384 rows) are marked and need a GPU + --all.
+      - name: Install torch (cpu)
+        run: python3 -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Q4 slice planner plan equality (patch 0020)
+        run: python3 tests/test_q4kv_slice_planner.py
